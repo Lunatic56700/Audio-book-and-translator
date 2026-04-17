@@ -1,0 +1,1222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Neural Audiobook Player</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <style>
+        :root {
+            --bg: #f0f2f5;
+            --panel-bg: #ffffff;
+            --panel-border: #e2e8f0;
+            --text: #1a202c;
+            --text-muted: #718096;
+            --accent: #3b82f6;
+            --accent-hover: #2563eb;
+            --accent-light: #eff6ff;
+            --danger: #ef4444;
+            --success: #10b981;
+            --input-bg: #f7fafc;
+            --shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        body.dark {
+            --bg: #0f172a;
+            --panel-bg: #1e293b;
+            --panel-border: #334155;
+            --text: #e2e8f0;
+            --text-muted: #94a3b8;
+            --accent: #60a5fa;
+            --accent-hover: #3b82f6;
+            --accent-light: #1e3a5f;
+            --danger: #f87171;
+            --success: #34d399;
+            --input-bg: #0f172a;
+            --shadow: 0 1px 3px rgba(0,0,0,0.4);
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+            background: var(--bg);
+            color: var(--text);
+            transition: background 0.25s, color 0.25s;
+        }
+
+        #book-progress-bar {
+            position: fixed;
+            top: 0; left: 0;
+            height: 3px;
+            background: var(--accent);
+            width: 0%;
+            z-index: 1000;
+            transition: width 0.5s ease;
+        }
+
+        #pdf-container {
+            flex: 2.5;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            background: #3a3d40;
+        }
+
+        #pdf-toolbar {
+            background: #2b2d2f;
+            padding: 0.4rem 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            flex-shrink: 0;
+            border-bottom: 1px solid #1a1a1a;
+        }
+        #pdf-toolbar input[type="text"] {
+            padding: 0.25rem 0.6rem;
+            border-radius: 5px;
+            border: 1px solid #555;
+            background: #1e2022;
+            color: #e0e0e0;
+            font-size: 0.82rem;
+            width: 160px;
+        }
+        #pdf-toolbar input[type="text"]:focus { outline: none; border-color: var(--accent); }
+        #pdf-toolbar button {
+            padding: 0.25rem 0.65rem;
+            font-size: 0.78rem;
+            border-radius: 5px;
+            background: #4a4d51;
+            color: #e0e0e0;
+            border: none;
+            cursor: pointer;
+            transition: 0.15s;
+        }
+        #pdf-toolbar button:hover { background: var(--accent); }
+        #search-results-info { color: #94a3b8; font-size: 0.78rem; }
+
+        #pdf-scroll-container {
+            flex: 1;
+            overflow-y: auto;
+            display: flex;
+            justify-content: center;
+            padding: 1.25rem;
+        }
+        #pdf-canvas { display: none; max-width: 100%; box-shadow: 0 6px 30px rgba(0,0,0,0.6); background: white; }
+        #pdf-placeholder {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+            color: #888;
+            gap: 0.75rem;
+            text-align: center;
+        }
+
+        #controls-container {
+            flex: 1;
+            min-width: 310px;
+            max-width: 370px;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            background: var(--panel-bg);
+            border-left: 1px solid var(--panel-border);
+            overflow: hidden;
+            transition: background 0.25s;
+        }
+
+        .panel-header {
+            padding: 0.85rem 1.1rem;
+            border-bottom: 1px solid var(--panel-border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-shrink: 0;
+            background: var(--panel-bg);
+        }
+        .panel-header h1 { font-size: 1rem; font-weight: 700; }
+        .header-btns { display: flex; gap: 0.35rem; }
+        .icon-btn {
+            background: none;
+            border: 1px solid var(--panel-border);
+            border-radius: 6px;
+            padding: 0.28rem 0.5rem;
+            cursor: pointer;
+            font-size: 0.95rem;
+            color: var(--text);
+            transition: 0.15s;
+        }
+        .icon-btn:hover { background: var(--accent-light); border-color: var(--accent); }
+
+        .tab-bar {
+            display: flex;
+            border-bottom: 1px solid var(--panel-border);
+            flex-shrink: 0;
+            background: var(--panel-bg);
+        }
+        .tab-btn {
+            flex: 1;
+            padding: 0.55rem 0.2rem;
+            font-size: 0.72rem;
+            text-align: center;
+            cursor: pointer;
+            border: none;
+            border-bottom: 2px solid transparent;
+            background: transparent;
+            color: var(--text-muted);
+            transition: 0.15s;
+            font-weight: 500;
+        }
+        .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+        .tab-btn:hover:not(.active) { color: var(--text); background: var(--accent-light); }
+
+        .tab-panel { display: none; }
+        .tab-panel.active {
+            display: flex;
+            flex-direction: column;
+            gap: 0.85rem;
+            padding: 1rem 1.1rem;
+            overflow-y: auto;
+            flex: 1;
+        }
+
+        .section { display: flex; flex-direction: column; gap: 0.45rem; }
+        .section-label {
+            font-size: 0.68rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.09em;
+            color: var(--text-muted);
+        }
+        .divider { height: 1px; background: var(--panel-border); }
+
+        /* Translation toggle */
+        .translate-row {
+            display: flex;
+            align-items: center;
+            gap: 0.55rem;
+            flex-wrap: wrap;
+        }
+        .toggle-switch {
+            position: relative;
+            width: 40px;
+            height: 22px;
+            flex-shrink: 0;
+        }
+        .toggle-switch input { opacity: 0; width: 0; height: 0; }
+        .toggle-slider {
+            position: absolute;
+            inset: 0;
+            background: var(--panel-border);
+            border-radius: 22px;
+            cursor: pointer;
+            transition: 0.25s;
+        }
+        .toggle-slider::before {
+            content: '';
+            position: absolute;
+            width: 16px; height: 16px;
+            left: 3px; bottom: 3px;
+            background: white;
+            border-radius: 50%;
+            transition: 0.25s;
+        }
+        .toggle-switch input:checked + .toggle-slider { background: #7c3aed; }
+        .toggle-switch input:checked + .toggle-slider::before { transform: translateX(18px); }
+        .translate-label { font-size: 0.82rem; font-weight: 500; }
+        .translate-lang-row {
+            display: none;
+            width: 100%;
+            margin-top: 0.25rem;
+        }
+        .translate-lang-row.visible { display: block; }
+        .lang-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            background: #7c3aed;
+            color: white;
+            font-size: 0.72rem;
+            font-weight: 600;
+            padding: 0.2rem 0.55rem;
+            border-radius: 20px;
+            width: fit-content;
+        }
+
+        #drop-zone {
+            border: 2px dashed var(--panel-border);
+            border-radius: 10px;
+            padding: 1.1rem;
+            text-align: center;
+            cursor: pointer;
+            transition: 0.2s;
+            background: var(--input-bg);
+            user-select: none;
+        }
+        #drop-zone:hover, #drop-zone.drag-over { border-color: var(--accent); background: var(--accent-light); }
+        #drop-zone .dz-icon { font-size: 1.8rem; }
+        #drop-zone strong { font-size: 0.85rem; display: block; margin-top: 0.2rem; color: var(--text); }
+        #drop-zone p { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.15rem; }
+
+        #resume-banner {
+            display: none;
+            background: var(--success);
+            color: white;
+            padding: 0.55rem 0.8rem;
+            border-radius: 7px;
+            font-size: 0.82rem;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        #resume-banner span { flex: 1; }
+        #resume-banner button {
+            background: rgba(255,255,255,0.25);
+            border: none;
+            border-radius: 4px;
+            color: white;
+            padding: 0.2rem 0.55rem;
+            cursor: pointer;
+            font-size: 0.78rem;
+        }
+        #resume-banner button:hover { background: rgba(255,255,255,0.4); }
+
+        .btn {
+            padding: 0.48rem 0.7rem;
+            border-radius: 6px;
+            border: none;
+            cursor: pointer;
+            font-size: 0.82rem;
+            font-weight: 500;
+            transition: 0.15s;
+            text-align: center;
+        }
+        .btn-primary { background: var(--accent); color: white; }
+        .btn-primary:hover { background: var(--accent-hover); }
+        .btn-secondary { background: var(--input-bg); color: var(--text); border: 1px solid var(--panel-border); }
+        .btn-secondary:hover { background: var(--accent-light); border-color: var(--accent); color: var(--accent); }
+        .btn-danger { background: var(--danger); color: white; }
+        .btn-row { display: flex; gap: 0.4rem; }
+        .btn-row .btn { flex: 1; }
+
+        input[type="number"], input[type="text"], select, textarea {
+            padding: 0.42rem 0.6rem;
+            font-size: 0.82rem;
+            border-radius: 6px;
+            border: 1px solid var(--panel-border);
+            background: var(--input-bg);
+            color: var(--text);
+            width: 100%;
+            transition: border-color 0.15s;
+        }
+        input:focus, select:focus { outline: none; border-color: var(--accent); }
+
+        audio { width: 100%; height: 34px; }
+
+        .slider-row { display: flex; align-items: center; gap: 0.6rem; }
+        input[type="range"] { flex: 1; accent-color: var(--accent); cursor: pointer; height: 4px; }
+        .slider-val { font-size: 0.75rem; color: var(--text-muted); min-width: 36px; text-align: right; font-variant-numeric: tabular-nums; }
+
+        .nav-row { display: flex; align-items: center; gap: 0.4rem; }
+        .nav-row input[type="number"] { width: 58px; text-align: center; }
+
+        .progress-track { height: 5px; background: var(--panel-border); border-radius: 3px; overflow: hidden; }
+        .progress-fill { height: 100%; background: var(--accent); width: 0%; border-radius: 3px; transition: width 0.4s; }
+
+        #status {
+            font-size: 0.8rem;
+            font-weight: 500;
+            color: var(--accent);
+            padding: 0.45rem 0.7rem;
+            background: var(--accent-light);
+            border-radius: 6px;
+            border-left: 3px solid var(--accent);
+            word-break: break-word;
+        }
+
+        #stats-box {
+            font-size: 0.78rem;
+            color: var(--text-muted);
+            padding: 0.5rem 0.65rem;
+            background: var(--input-bg);
+            border: 1px solid var(--panel-border);
+            border-radius: 6px;
+            line-height: 1.8;
+        }
+
+        #toc-container {
+            max-height: 220px;
+            overflow-y: auto;
+            border: 1px solid var(--panel-border);
+            border-radius: 7px;
+            background: var(--input-bg);
+        }
+        .toc-item {
+            padding: 0.3rem 0.6rem;
+            cursor: pointer;
+            font-size: 0.8rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            transition: 0.12s;
+            border-bottom: 1px solid var(--panel-border);
+        }
+        .toc-item:last-child { border-bottom: none; }
+        .toc-item:hover { background: var(--accent-light); color: var(--accent); }
+        .toc-page-num { color: var(--text-muted); font-size: 0.72rem; }
+        .list-empty { color: var(--text-muted); font-size: 0.78rem; padding: 0.75rem; }
+
+        #bookmarks-list { display: flex; flex-direction: column; gap: 0.3rem; max-height: 280px; overflow-y: auto; }
+        .bookmark-item {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.35rem 0.55rem;
+            border-radius: 6px;
+            background: var(--input-bg);
+            border: 1px solid var(--panel-border);
+            font-size: 0.78rem;
+        }
+        .bookmark-jump { cursor: pointer; color: var(--accent); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .bookmark-jump:hover { text-decoration: underline; }
+        .bookmark-del { background: none; border: none; color: var(--danger); cursor: pointer; font-size: 0.9rem; flex-shrink: 0; }
+
+        .shortcuts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.35rem; font-size: 0.75rem; color: var(--text-muted); }
+        .shortcut-item { display: flex; align-items: center; gap: 0.35rem; }
+        kbd { background: var(--panel-border); border-radius: 3px; padding: 0.05rem 0.35rem; font-size: 0.68rem; font-family: monospace; color: var(--text); white-space: nowrap; }
+
+        #sleep-countdown { font-size: 0.75rem; color: var(--success); font-variant-numeric: tabular-nums; }
+
+        ::-webkit-scrollbar { width: 5px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--panel-border); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+        /* Library cards */
+        .lib-search-row { display: flex; gap: 0.4rem; }
+        .lib-search-row input { flex: 1; }
+        .lib-search-row .btn { flex-shrink: 0; }
+        #lib-results { display: flex; flex-direction: column; gap: 0.5rem; max-height: 500px; overflow-y: auto; }
+        .lib-card {
+            display: flex;
+            gap: 0.6rem;
+            padding: 0.55rem;
+            border: 1px solid var(--panel-border);
+            border-radius: 8px;
+            background: var(--input-bg);
+            cursor: pointer;
+            transition: 0.15s;
+        }
+        .lib-card:hover { border-color: var(--accent); background: var(--accent-light); }
+        .lib-card img {
+            width: 48px;
+            height: 68px;
+            object-fit: cover;
+            border-radius: 4px;
+            flex-shrink: 0;
+            background: var(--panel-border);
+        }
+        .lib-card-info { flex: 1; min-width: 0; }
+        .lib-card-title {
+            font-size: 0.82rem;
+            font-weight: 600;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .lib-card-author { font-size: 0.72rem; color: var(--text-muted); }
+        .lib-card-meta { font-size: 0.68rem; color: var(--text-muted); margin-top: 0.2rem; }
+        .lib-loading { text-align: center; padding: 1rem; color: var(--text-muted); font-size: 0.82rem; }
+        .lib-load-more {
+            text-align: center;
+            padding: 0.4rem;
+            font-size: 0.78rem;
+            color: var(--accent);
+            cursor: pointer;
+        }
+        .lib-load-more:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+
+<div id="book-progress-bar"></div>
+
+<!-- LEFT: PDF VIEWER -->
+<div id="pdf-container">
+    <div id="pdf-toolbar">
+        <span style="color:#aaa;font-size:0.85rem;">🔍</span>
+        <input type="text" id="search-input" placeholder="Search text in book…"
+               onkeydown="if(event.key==='Enter') searchText()">
+        <button onclick="searchText()">Find</button>
+        <span id="search-results-info"></span>
+        <span style="flex:1"></span>
+        <button onclick="adjustZoom(-0.2)">−</button>
+        <span id="zoom-label" style="color:#ccc;font-size:0.78rem;min-width:38px;text-align:center">100%</span>
+        <button onclick="adjustZoom(0.2)">+</button>
+    </div>
+    <div id="pdf-scroll-container">
+        <div id="pdf-placeholder">
+            <div style="font-size:5rem">📚</div>
+            <p style="font-size:1rem;color:#bbb">No book loaded</p>
+            <p style="font-size:0.82rem;color:#777">Upload a PDF to listen as an audiobook</p>
+        </div>
+        <canvas id="pdf-canvas"></canvas>
+    </div>
+</div>
+
+<!-- RIGHT: CONTROLS -->
+<div id="controls-container">
+    <div class="panel-header">
+        <h1>📖 Audiobook Player</h1>
+        <div class="header-btns">
+            <button class="icon-btn" onclick="toggleDark()" title="Toggle dark mode">🌙</button>
+        </div>
+    </div>
+
+    <div class="tab-bar">
+        <button class="tab-btn active" id="tab-play"      onclick="showTab('play')">▶ Play</button>
+        <button class="tab-btn"        id="tab-library"   onclick="showTab('library')">📚 Library</button>
+        <button class="tab-btn"        id="tab-chapters"  onclick="showTab('chapters')">📑 TOC</button>
+        <button class="tab-btn"        id="tab-bookmarks" onclick="showTab('bookmarks')">🔖 Marks</button>
+        <button class="tab-btn"        id="tab-settings"  onclick="showTab('settings')">⚙ More</button>
+    </div>
+
+    <!-- PLAY TAB -->
+    <div class="tab-panel active" id="panel-play">
+
+        <div class="section">
+            <span class="section-label">Book</span>
+
+            <!-- Translation toggle -->
+            <div class="translate-row">
+                <label class="toggle-switch">
+                    <input type="checkbox" id="translate-toggle" onchange="onTranslateToggle()">
+                    <span class="toggle-slider"></span>
+                </label>
+                <span class="translate-label">🌐 Enable Translation</span>
+            </div>
+            <div class="translate-lang-row" id="translate-lang-row">
+                <select id="translate-lang" onchange="onTranslateLangChange()">
+                    <option value="">— Select language —</option>
+                </select>
+                <div class="lang-badge" id="translate-badge" style="margin-top:0.3rem;display:none">🌐 Translating → <span id="translate-badge-lang"></span></div>
+            </div>
+
+            <div id="drop-zone"
+                 ondragover="handleDragOver(event)"
+                 ondragleave="handleDragLeave(event)"
+                 ondrop="handleDrop(event)"
+                 onclick="document.getElementById('pdf-upload').click()">
+                <div class="dz-icon">📥</div>
+                <strong id="drop-label">Drop PDF here or click to browse</strong>
+                <p>Supports any PDF document</p>
+                <input type="file" id="pdf-upload" accept="application/pdf"
+                       style="display:none" onchange="uploadFromInput()">
+            </div>
+            <div id="resume-banner">
+                <span id="resume-text">Resume from page ?</span>
+                <button onclick="resumeReading()">Resume</button>
+                <button onclick="document.getElementById('resume-banner').style.display='none'">✕</button>
+            </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="section">
+            <span class="section-label">Playback</span>
+            <audio id="audio-player" controls></audio>
+            <div class="btn-row">
+                <button class="btn btn-secondary" onclick="skipAudio(-15)">⏪ 15s</button>
+                <button class="btn btn-secondary" onclick="skipAudio(15)">15s ⏩</button>
+            </div>
+            <div class="slider-row">
+                <span title="Slow" style="font-size:0.85rem">🐢</span>
+                <input type="range" id="speed-slider" min="0.5" max="3" step="0.1" value="1"
+                       oninput="changeSpeed(this.value)">
+                <span title="Fast" style="font-size:0.85rem">🐇</span>
+                <span class="slider-val" id="speed-label">1.0×</span>
+            </div>
+            <div class="slider-row">
+                <span style="font-size:0.85rem">🔈</span>
+                <input type="range" id="volume-slider" min="0" max="1" step="0.05" value="1"
+                       oninput="changeVolume(this.value)">
+                <span style="font-size:0.85rem">🔊</span>
+                <span class="slider-val" id="volume-label">100%</span>
+            </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="section">
+            <span class="section-label">Navigation — <span id="total-pages">0</span> pages</span>
+            <div class="progress-track">
+                <div class="progress-fill" id="page-progress"></div>
+            </div>
+            <div class="nav-row">
+                <button class="btn btn-secondary" onclick="changePage(-1)">◀ Prev</button>
+                <input type="number" id="page-input" value="1" min="1">
+                <button class="btn btn-primary"   onclick="goToPage()">Go</button>
+                <button class="btn btn-secondary" onclick="changePage(1)">Next ▶</button>
+            </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="section">
+            <div id="status">⏳ Waiting for PDF upload…</div>
+            <div id="stats-box">
+                🕐 <strong id="stat-time">0m 0s</strong> listened &nbsp;·&nbsp;
+                📖 <strong id="stat-pages">0 / 0</strong> pages &nbsp;·&nbsp;
+                📊 <strong id="stat-pct">0%</strong>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- TOC TAB -->
+    <div class="tab-panel" id="panel-chapters">
+        <div class="section">
+            <span class="section-label">Table of Contents</span>
+            <div id="toc-container">
+                <p class="list-empty">Load a book to see its chapters.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- BOOKMARKS TAB -->
+    <div class="tab-panel" id="panel-bookmarks">
+        <div class="section">
+            <span class="section-label">Bookmarks</span>
+            <button class="btn btn-primary" onclick="addBookmark()">🔖 Bookmark Current Position</button>
+            <div id="bookmarks-list">
+                <p class="list-empty">No bookmarks yet. Press <kbd>B</kbd> while listening.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- SETTINGS TAB -->
+    <div class="tab-panel" id="panel-settings">
+
+        <div class="section">
+            <span class="section-label">Voice</span>
+            <select id="voice-select" onchange="handleVoiceChange()">
+                <option value="en-US-AriaNeural">Aria (US Female)</option>
+                <option value="en-US-GuyNeural">Guy (US Male)</option>
+            </select>
+            <button class="btn btn-secondary" onclick="refreshVoices()">🔄 Refresh Voices</button>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="section">
+            <span class="section-label">Sleep Timer</span>
+            <select id="sleep-select" onchange="setSleepTimer(parseInt(this.value))">
+                <option value="0">Off</option>
+                <option value="15">15 minutes</option>
+                <option value="30">30 minutes</option>
+                <option value="45">45 minutes</option>
+                <option value="60">1 hour</option>
+                <option value="90">1.5 hours</option>
+                <option value="120">2 hours</option>
+            </select>
+            <span id="sleep-countdown"></span>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="section">
+            <span class="section-label">Appearance</span>
+            <button class="btn btn-secondary" onclick="toggleDark()">🌙 Toggle Dark Mode</button>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="section">
+            <span class="section-label">Keyboard Shortcuts</span>
+            <div class="shortcuts-grid">
+                <div class="shortcut-item"><kbd>Space</kbd> Play / Pause</div>
+                <div class="shortcut-item"><kbd>←</kbd><kbd>→</kbd> Page</div>
+                <div class="shortcut-item"><kbd>↑</kbd><kbd>↓</kbd> Volume</div>
+                <div class="shortcut-item"><kbd>,</kbd><kbd>.</kbd> Speed</div>
+                <div class="shortcut-item"><kbd>B</kbd> Bookmark</div>
+                <div class="shortcut-item"><kbd>F</kbd> Search</div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- LIBRARY TAB -->
+    <div class="tab-panel" id="panel-library">
+        <div class="section">
+            <span class="section-label">📚 Project Gutenberg — Free Books</span>
+            <div class="lib-search-row">
+                <input type="text" id="lib-search-input" placeholder="Search books (title or author)…"
+                       onkeydown="if(event.key==='Enter') searchGutenberg()">
+                <button class="btn btn-primary" onclick="searchGutenberg()">Search</button>
+            </div>
+        </div>
+        <div class="section">
+            <div id="lib-results">
+                <p class="list-empty">Search for a book above to browse the free Gutenberg library (70,000+ titles).</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+let currentPage     = 1;
+let totalPages      = 0;
+let pdfUrl          = "";
+let preloadedPages  = new Set();
+let pdfDoc          = null;
+let pdfScale        = 1.5;
+let resumePage      = 1;
+let resumePosition  = 0;
+let pendingJump     = false;
+let sleepTimer      = null;
+let sleepEndTime    = null;
+let sleepInterval   = null;
+let pagesRead       = new Set();
+let totalListenSecs = 0;
+let supportedLangs  = [];
+
+// Theme
+function toggleDark() {
+    document.body.classList.toggle('dark');
+    localStorage.setItem('darkMode', document.body.classList.contains('dark'));
+}
+if (localStorage.getItem('darkMode') === 'true') document.body.classList.add('dark');
+
+// Tabs
+function showTab(name) {
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById('panel-' + name).classList.add('active');
+    document.getElementById('tab-' + name).classList.add('active');
+}
+
+// ── Translation toggle & language picker ─────────────────────────────
+function isTranslateOn() {
+    return document.getElementById('translate-toggle').checked;
+}
+
+function getTranslateLang() {
+    if (!isTranslateOn()) return '';
+    return document.getElementById('translate-lang').value || '';
+}
+
+function onTranslateToggle() {
+    const on = isTranslateOn();
+    const row = document.getElementById('translate-lang-row');
+    row.classList.toggle('visible', on);
+    if (!on) {
+        document.getElementById('translate-badge').style.display = 'none';
+    }
+    // Voices depend on language — refresh
+    updateVoicesForCurrentLang();
+    preloadedPages.clear();
+}
+
+function onTranslateLangChange() {
+    const lang = getTranslateLang();
+    const badge = document.getElementById('translate-badge');
+    if (lang) {
+        const info = supportedLangs.find(l => l.code === lang);
+        document.getElementById('translate-badge-lang').innerText = info ? info.name : lang;
+        badge.style.display = 'inline-flex';
+    } else {
+        badge.style.display = 'none';
+    }
+    updateVoicesForCurrentLang();
+    preloadedPages.clear();
+}
+
+async function loadSupportedLanguages() {
+    try {
+        supportedLangs = await (await fetch('/get_supported_languages')).json();
+        const sel = document.getElementById('translate-lang');
+        sel.innerHTML = '<option value="">— Select language —</option>' +
+            supportedLangs.map(l => `<option value="${l.code}">${l.name}</option>`).join('');
+    } catch(e) { console.error('Failed to load languages', e); }
+}
+
+function getActiveLocalePrefix() {
+    if (isTranslateOn()) {
+        const lang = getTranslateLang();
+        if (lang) {
+            const info = supportedLangs.find(l => l.code === lang);
+            return info ? info.locale : 'en-';
+        }
+    }
+    return 'en-';
+}
+
+async function updateVoicesForCurrentLang() {
+    const locale = getActiveLocalePrefix();
+    await loadVoicesForLocale(locale);
+}
+
+async function loadVoicesForLocale(locale) {
+    const sel = document.getElementById('voice-select');
+    const cur = sel.value;
+    sel.disabled = true;
+    sel.innerHTML = '<option>Loading…</option>';
+    try {
+        const voices = await (await fetch(`/get_voices?locale=${locale}`)).json();
+        sel.innerHTML = voices.length
+            ? voices.map(v => `<option value="${v.ShortName}">${v.FriendlyName}</option>`).join('')
+            : '<option value="en-US-AriaNeural">Aria (US Female)</option>';
+        if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+    } catch {
+        sel.innerHTML = '<option value="en-US-AriaNeural">Aria (US Female)</option><option value="en-US-GuyNeural">Guy (US Male)</option>';
+    }
+    sel.disabled = false;
+}
+
+async function refreshVoices() {
+    await updateVoicesForCurrentLang();
+}
+
+// ── Drag & Drop ──────────────────────────────────────────────────────
+function handleDragOver(e) { e.preventDefault(); document.getElementById('drop-zone').classList.add('drag-over'); }
+function handleDragLeave(e) { document.getElementById('drop-zone').classList.remove('drag-over'); }
+function handleDrop(e) {
+    e.preventDefault();
+    document.getElementById('drop-zone').classList.remove('drag-over');
+    const file = e.dataTransfer.files[0];
+    if (file && file.type === 'application/pdf') uploadFile(file);
+    else alert('Please drop a PDF file.');
+}
+function uploadFromInput() {
+    const file = document.getElementById('pdf-upload').files[0];
+    if (file) uploadFile(file);
+}
+
+async function uploadFile(file) {
+    setStatus('⏳ Uploading and parsing…');
+    preloadedPages.clear(); pagesRead.clear(); totalListenSecs = 0; updateStats();
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+        const resp = await fetch('/upload', { method: 'POST', body: formData });
+        const data = await resp.json();
+        if (data.error) { setStatus('❌ ' + data.error); return; }
+
+        totalPages = data.total_pages;
+        pdfUrl     = data.pdf_url;
+        document.getElementById('total-pages').innerText = totalPages;
+        document.getElementById('drop-label').innerText  = data.title || file.name;
+        document.getElementById('page-input').max        = totalPages;
+
+        await initPDFJS(pdfUrl);
+        loadTOC();
+        loadBookmarks();
+
+        if (data.resume_page && data.resume_page > 1) {
+            resumePage     = data.resume_page;
+            resumePosition = data.resume_position || 0;
+            document.getElementById('resume-text').innerText = `Resume from page ${resumePage}`;
+            document.getElementById('resume-banner').style.display = 'flex';
+            loadPage(1);
+        } else {
+            loadPage(1);
+        }
+    } catch (err) {
+        setStatus('❌ Upload failed. Is Flask running on port 5000?');
+    }
+}
+
+function resumeReading() {
+    document.getElementById('resume-banner').style.display = 'none';
+    pendingJump = true;
+    loadPage(resumePage);
+}
+
+// ── PDF.js ───────────────────────────────────────────────────────────
+async function initPDFJS(url) {
+    document.getElementById('pdf-placeholder').style.display = 'none';
+    document.getElementById('pdf-canvas').style.display = 'block';
+    pdfDoc = await pdfjsLib.getDocument(url).promise;
+}
+
+async function renderPage(num) {
+    if (!pdfDoc) return;
+    const page     = await pdfDoc.getPage(num);
+    const canvas   = document.getElementById('pdf-canvas');
+    const ctx      = canvas.getContext('2d');
+    const viewport = page.getViewport({ scale: pdfScale });
+    canvas.width   = viewport.width;
+    canvas.height  = viewport.height;
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    document.getElementById('pdf-scroll-container').scrollTop = 0;
+}
+
+function adjustZoom(delta) {
+    pdfScale = Math.min(Math.max(pdfScale + delta, 0.5), 4.5);
+    document.getElementById('zoom-label').innerText = Math.round((pdfScale / 1.5) * 100) + '%';
+    renderPage(currentPage);
+}
+
+// ── Search ───────────────────────────────────────────────────────────
+async function searchText() {
+    const query = document.getElementById('search-input').value.trim().toLowerCase();
+    const info  = document.getElementById('search-results-info');
+    if (!pdfDoc || !query) { info.innerText = ''; return; }
+    info.innerText = '🔍 Searching…';
+    const matches = [];
+    for (let i = 1; i <= pdfDoc.numPages; i++) {
+        const page = await pdfDoc.getPage(i);
+        const tc   = await page.getTextContent();
+        const text = tc.items.map(t => t.str).join(' ').toLowerCase();
+        if (text.includes(query)) matches.push(i);
+    }
+    info.innerText = matches.length > 0
+        ? `✔ ${matches.length} page(s): ${matches.slice(0,6).join(', ')}${matches.length > 6 ? '…' : ''}`
+        : '✘ Not found';
+}
+
+// ── Page loading ─────────────────────────────────────────────────────
+async function loadPage(pageNum) {
+    if (pageNum < 1 || pageNum > totalPages) return;
+    currentPage = pageNum;
+    document.getElementById('page-input').value = currentPage;
+    renderPage(currentPage);
+    updateProgress();
+    pagesRead.add(currentPage);
+    updateStats();
+
+    const voice = document.getElementById('voice-select').value;
+    const translateTo = getTranslateLang();
+
+    if (translateTo) {
+        const langInfo = supportedLangs.find(l => l.code === translateTo);
+        setStatus(`🌐 Translating & generating audio for page ${currentPage} → ${langInfo ? langInfo.name : translateTo}…`);
+    } else {
+        setStatus(`🔊 Loading audio for page ${currentPage}…`);
+    }
+
+    let url = `/get_audio/${currentPage}/${voice}`;
+    if (translateTo) url += `?translate_to=${translateTo}`;
+
+    try {
+        const resp = await fetch(url);
+        const data = await resp.json();
+
+        if (data.skip) {
+            setStatus(`⏭ Page ${currentPage} is blank/image — skipping…`);
+            setTimeout(() => changePage(1), 700);
+            return;
+        }
+
+        if (data.audio_url) {
+            const player = document.getElementById('audio-player');
+            player.src   = data.audio_url;
+
+            if (pendingJump && resumePosition > 0) {
+                player.addEventListener('loadedmetadata', () => {
+                    player.currentTime = resumePosition;
+                    pendingJump = false;
+                }, { once: true });
+            }
+
+            player.playbackRate = parseFloat(document.getElementById('speed-slider').value);
+            player.play();
+
+            if (translateTo) {
+                const langInfo = supportedLangs.find(l => l.code === translateTo);
+                setStatus(`🔊 Playing page ${currentPage} of ${totalPages} (translated to ${langInfo ? langInfo.name : translateTo})`);
+            } else {
+                setStatus(`🔊 Playing page ${currentPage} of ${totalPages}`);
+            }
+            preloadNextPages(currentPage, 2);
+        }
+    } catch {
+        setStatus('❌ Could not load audio.');
+    }
+}
+
+function preloadNextPages(start, count) {
+    const voice = document.getElementById('voice-select').value;
+    const translateTo = getTranslateLang();
+    for (let i = 1; i <= count; i++) {
+        const t = start + i;
+        const key = `${t}_${voice}_${translateTo}`;
+        if (t <= totalPages && !preloadedPages.has(key)) {
+            preloadedPages.add(key);
+            let url = `/get_audio/${t}/${voice}`;
+            if (translateTo) url += `?translate_to=${translateTo}`;
+            fetch(url).catch(() => {});
+        }
+    }
+}
+
+function updateProgress() {
+    const pct = totalPages > 0 ? ((currentPage - 1) / totalPages) * 100 : 0;
+    document.getElementById('book-progress-bar').style.width = pct + '%';
+    document.getElementById('page-progress').style.width     = pct + '%';
+}
+
+// ── TOC ──────────────────────────────────────────────────────────────
+async function loadTOC() {
+    const toc    = await (await fetch('/get_toc')).json();
+    const tocDiv = document.getElementById('toc-container');
+    tocDiv.innerHTML = toc.length
+        ? toc.map(item =>
+            `<div class="toc-item" onclick="loadPage(${item.page})"
+                  style="padding-left:${0.5 + (item.level - 1) * 0.75}rem">
+                ${item.title}<span class="toc-page-num"> p.${item.page}</span>
+             </div>`).join('')
+        : '<p class="list-empty">No chapters found in this PDF.</p>';
+}
+
+// ── Bookmarks ────────────────────────────────────────────────────────
+async function addBookmark() {
+    if (!totalPages) return;
+    const note = prompt('Optional note for this bookmark:', '') || '';
+    await fetch('/add_bookmark', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ page: currentPage, position: document.getElementById('audio-player').currentTime, note })
+    });
+    loadBookmarks();
+    showTab('bookmarks');
+}
+
+async function loadBookmarks() {
+    const marks  = await (await fetch('/get_bookmarks')).json();
+    const listEl = document.getElementById('bookmarks-list');
+    listEl.innerHTML = marks.length
+        ? marks.map(b =>
+            `<div class="bookmark-item">
+                <span class="bookmark-jump" onclick="jumpToBookmark(${b.page}, ${b.position})">
+                    📌 p.${b.page}${b.note ? ' — ' + b.note : ''}
+                </span>
+                <button class="bookmark-del" onclick="deleteBookmark(${b.id})">✕</button>
+             </div>`).join('')
+        : '<p class="list-empty">No bookmarks yet. Press <kbd>B</kbd> while listening.</p>';
+}
+
+async function jumpToBookmark(page, position) { resumePosition = position; pendingJump = true; await loadPage(page); }
+async function deleteBookmark(id) { await fetch(`/delete_bookmark/${id}`, { method: 'DELETE' }); loadBookmarks(); }
+
+// ── Playback controls ────────────────────────────────────────────────
+function changePage(d)   { loadPage(currentPage + d); }
+function goToPage()      { loadPage(parseInt(document.getElementById('page-input').value)); }
+function skipAudio(s)    { document.getElementById('audio-player').currentTime += s; }
+function changeSpeed(v)  { document.getElementById('audio-player').playbackRate = v; document.getElementById('speed-label').innerText = parseFloat(v).toFixed(1) + '×'; }
+function changeVolume(v) { document.getElementById('audio-player').volume = v; document.getElementById('volume-label').innerText = Math.round(v * 100) + '%'; }
+function handleVoiceChange() { preloadedPages.clear(); loadPage(currentPage); }
+
+// ── Sleep timer ──────────────────────────────────────────────────────
+function setSleepTimer(minutes) {
+    if (sleepTimer)    clearTimeout(sleepTimer);
+    if (sleepInterval) clearInterval(sleepInterval);
+    document.getElementById('sleep-countdown').innerText = '';
+    if (minutes === 0) return;
+    sleepEndTime = Date.now() + minutes * 60_000;
+    sleepTimer   = setTimeout(() => {
+        document.getElementById('audio-player').pause();
+        setStatus('😴 Sleep timer reached — paused.');
+        document.getElementById('sleep-countdown').innerText = '';
+        clearInterval(sleepInterval);
+    }, minutes * 60_000);
+    sleepInterval = setInterval(() => {
+        const left = sleepEndTime - Date.now();
+        if (left <= 0) { clearInterval(sleepInterval); return; }
+        const m = Math.floor(left / 60_000), s = Math.floor((left % 60_000) / 1000);
+        document.getElementById('sleep-countdown').innerText = `⏰ Stops in ${m}m ${s}s`;
+    }, 1000);
+}
+
+// ── Stats ────────────────────────────────────────────────────────────
+function updateStats() {
+    const h = Math.floor(totalListenSecs / 3600), m = Math.floor((totalListenSecs % 3600) / 60), s = totalListenSecs % 60;
+    const pct = totalPages > 0 ? Math.round((pagesRead.size / totalPages) * 100) : 0;
+    document.getElementById('stat-time').innerText  = h > 0 ? `${h}h ${m}m` : `${m}m ${s}s`;
+    document.getElementById('stat-pages').innerText = `${pagesRead.size} / ${totalPages}`;
+    document.getElementById('stat-pct').innerText   = pct + '%';
+}
+
+setInterval(() => {
+    const a = document.getElementById('audio-player');
+    if (!a.paused && totalPages > 0) { totalListenSecs++; pagesRead.add(currentPage); if (totalListenSecs % 3 === 0) updateStats(); }
+}, 1000);
+
+setInterval(() => {
+    const a = document.getElementById('audio-player');
+    if (!a.paused && totalPages > 0) {
+        fetch('/save_progress', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ page: currentPage, position: a.currentTime })
+        }).catch(() => {});
+    }
+}, 10_000);
+
+document.getElementById('audio-player').addEventListener('ended', () => {
+    if (currentPage < totalPages) changePage(1);
+});
+
+// ── Keyboard shortcuts ───────────────────────────────────────────────
+document.addEventListener('keydown', (e) => {
+    if (['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName)) return;
+    const a = document.getElementById('audio-player');
+    switch (e.key) {
+        case ' ':        e.preventDefault(); a.paused ? a.play() : a.pause(); break;
+        case 'ArrowRight': e.preventDefault(); changePage(1); break;
+        case 'ArrowLeft':  e.preventDefault(); changePage(-1); break;
+        case 'ArrowUp': { e.preventDefault(); const v = Math.min(1, a.volume + 0.1); a.volume = v; document.getElementById('volume-slider').value = v; document.getElementById('volume-label').innerText = Math.round(v*100)+'%'; break; }
+        case 'ArrowDown': { e.preventDefault(); const v = Math.max(0, a.volume - 0.1); a.volume = v; document.getElementById('volume-slider').value = v; document.getElementById('volume-label').innerText = Math.round(v*100)+'%'; break; }
+        case '.': { const ns = Math.min(3, parseFloat(document.getElementById('speed-slider').value)+0.1); document.getElementById('speed-slider').value = ns; changeSpeed(ns); break; }
+        case ',': { const ns = Math.max(0.5, parseFloat(document.getElementById('speed-slider').value)-0.1); document.getElementById('speed-slider').value = ns; changeSpeed(ns); break; }
+        case 'b': case 'B': addBookmark(); break;
+        case 'f': case 'F': e.preventDefault(); document.getElementById('search-input').focus(); break;
+    }
+});
+
+function setStatus(msg) { document.getElementById('status').innerText = msg; }
+
+// ── Gutenberg Library ────────────────────────────────────────────────
+let gutenbergNextPage = null;
+
+async function searchGutenberg(append = false) {
+    const query = document.getElementById('lib-search-input').value.trim();
+    if (!query) return;
+
+    const container = document.getElementById('lib-results');
+    if (!append) {
+        container.innerHTML = '<div class="lib-loading">🔍 Searching Gutenberg…</div>';
+    } else {
+        // Remove the "load more" button
+        const btn = container.querySelector('.lib-load-more');
+        if (btn) btn.innerText = '⏳ Loading…';
+    }
+
+    const url = append && gutenbergNextPage
+        ? `/gutenberg/search?q=${encodeURIComponent(query)}&page=${gutenbergNextPage}`
+        : `/gutenberg/search?q=${encodeURIComponent(query)}`;
+
+    try {
+        const data = await (await fetch(url)).json();
+        if (data.error) {
+            container.innerHTML = `<p class="list-empty">❌ ${data.error}</p>`;
+            return;
+        }
+
+        const results = data.results || [];
+        if (!append) container.innerHTML = '';
+
+        if (results.length === 0 && !append) {
+            container.innerHTML = '<p class="list-empty">No books found. Try a different search.</p>';
+            return;
+        }
+
+        // Remove old load-more button
+        const oldBtn = container.querySelector('.lib-load-more');
+        if (oldBtn) oldBtn.remove();
+
+        results.forEach(book => {
+            const card = document.createElement('div');
+            card.className = 'lib-card';
+            card.onclick = () => downloadGutenbergBook(book.id, book.title);
+            const coverSrc = book.cover || '';
+            const langs = (book.languages || []).join(', ').toUpperCase();
+            card.innerHTML = `
+                ${coverSrc ? `<img src="${coverSrc}" alt="Cover" loading="lazy">` : '<img src="" alt="" style="visibility:hidden">'}
+                <div class="lib-card-info">
+                    <div class="lib-card-title" title="${book.title}">${book.title}</div>
+                    <div class="lib-card-author">${book.author}</div>
+                    <div class="lib-card-meta">📥 ${(book.downloads || 0).toLocaleString()} downloads · ${langs}</div>
+                </div>
+            `;
+            container.appendChild(card);
+        });
+
+        // Show count
+        if (!append) {
+            const info = document.createElement('div');
+            info.className = 'lib-card-meta';
+            info.style.cssText = 'padding:0.3rem 0;text-align:center';
+            info.innerText = `Found ${data.count.toLocaleString()} results`;
+            container.prepend(info);
+        }
+
+        // Parse next page number from gutendex URL
+        gutenbergNextPage = null;
+        if (data.next) {
+            const m = data.next.match(/page=(\d+)/);
+            if (m) gutenbergNextPage = m[1];
+        }
+
+        if (gutenbergNextPage) {
+            const more = document.createElement('div');
+            more.className = 'lib-load-more';
+            more.innerText = '▼ Load more results';
+            more.onclick = (e) => { e.stopPropagation(); searchGutenberg(true); };
+            container.appendChild(more);
+        }
+
+    } catch (err) {
+        container.innerHTML = '<p class="list-empty">❌ Failed to search. Check your connection.</p>';
+    }
+}
+
+async function downloadGutenbergBook(bookId, title) {
+    setStatus(`📥 Downloading "${title}" from Gutenberg…`);
+    showTab('play');
+
+    const dropLabel = document.getElementById('drop-label');
+    dropLabel.innerText = `⏳ Loading: ${title}`;
+
+    try {
+        const resp = await fetch(`/gutenberg/download/${bookId}`);
+        const data = await resp.json();
+
+        if (data.error) {
+            setStatus(`❌ ${data.error}`);
+            dropLabel.innerText = 'Drop PDF here or click to browse';
+            return;
+        }
+
+        // Reuse the same flow as uploadFile after receiving data
+        totalPages = data.total_pages;
+        pdfUrl     = data.pdf_url;
+        preloadedPages.clear(); pagesRead.clear(); totalListenSecs = 0; updateStats();
+
+        document.getElementById('total-pages').innerText = totalPages;
+        dropLabel.innerText = data.title || title;
+        document.getElementById('page-input').max = totalPages;
+
+        await initPDFJS(pdfUrl);
+        loadTOC();
+        loadBookmarks();
+
+        if (data.resume_page && data.resume_page > 1) {
+            resumePage     = data.resume_page;
+            resumePosition = data.resume_position || 0;
+            document.getElementById('resume-text').innerText = `Resume from page ${resumePage}`;
+            document.getElementById('resume-banner').style.display = 'flex';
+            loadPage(1);
+        } else {
+            loadPage(1);
+        }
+
+    } catch (err) {
+        setStatus('❌ Failed to download book.');
+        dropLabel.innerText = 'Drop PDF here or click to browse';
+    }
+}
+
+// ── Init ─────────────────────────────────────────────────────────────
+loadSupportedLanguages();
+</script>
+</body>
+</html>
+
