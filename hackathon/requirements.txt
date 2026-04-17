@@ -1,0 +1,6 @@
+Flask
+PyMuPDF
+requests
+fpdf2
+edge-tts
+deep-translator
