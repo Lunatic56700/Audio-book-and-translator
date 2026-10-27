@@ -1,26 +1,36 @@
 import os
+import re
+import sys
+import time
 import asyncio
-import glob
-import textwrap
+import threading
+import subprocess
+from collections import Counter
+
 import fitz  # PyMuPDF
 import requests as http_requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from flask import Flask, render_template, request, jsonify, url_for
+from flask import Flask, Response, render_template, request, jsonify, url_for, send_from_directory, send_file
+from werkzeug.utils import secure_filename
 from fpdf import FPDF
 import edge_tts
 from deep_translator import GoogleTranslator
 from database import (
-    init_db, register_book, save_progress, get_progress,
+    init_db, register_book, save_progress, get_progress, get_books_info,
     add_bookmark, get_bookmarks, delete_bookmark
 )
 
 app = Flask(__name__)
 
-UPLOAD_FOLDER = os.path.join('static', 'uploads')
-AUDIO_FOLDER  = os.path.join('static', 'audio')
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BOOKS_FOLDER = os.path.join(BASE_DIR, 'books')            # Drop PDFs here to add them to the library
+AUDIO_FOLDER = os.path.join(BASE_DIR, 'static', 'audio')  # One cache sub-folder per book
+os.makedirs(BOOKS_FOLDER, exist_ok=True)
 os.makedirs(AUDIO_FOLDER, exist_ok=True)
 
+VOICE_RE = re.compile(r'^[A-Za-z]{2,3}-[A-Za-z0-9-]+$')
+PAGE_NUMBER_RE = re.compile(r'^(page\s+)?\d{1,4}$', re.IGNORECASE)
+
+# Initialize the SQLite database on startup
 init_db()
 
 # Supported languages for translation & TTS
@@ -40,73 +50,426 @@ SUPPORTED_LANGUAGES = [
     {"code": "tr", "name": "Turkish",              "locale": "tr-",  "default_voice": "tr-TR-EmelNeural"},
     {"code": "it", "name": "Italian",              "locale": "it-",  "default_voice": "it-IT-ElsaNeural"},
 ]
+LANGUAGE_CODES = {lang["code"] for lang in SUPPORTED_LANGUAGES}
 
-session_data = {
-    "pdf_path":     None,
-    "total_pages":  0,
-    "current_book": None
-}
+# Running headers/footers per book, keyed by (path, mtime) so replaced files are re-scanned
+_boilerplate_cache = {}
+_boilerplate_lock = threading.Lock()
+
+# Pages currently being synthesized, keyed by their cache path
+_jobs = {}
+_jobs_lock = threading.Lock()
+
+# Microsoft's voice service can be slow on long text (whole pages sometimes arrive at
+# real-time speed, ~3 min per page). Short sections come back in well under a second,
+# so pages are cut into sections, a few are made in parallel, and the audio is
+# streamed to the browser in order as it arrives.
+MAX_TTS_CONNECTIONS = 4   # Too many at once and the service starts refusing requests
+SEGMENT_CHARS = 350       # ~20 seconds of speech per section
+
+
+# =============================================
+#  HELPERS
+# =============================================
+def resolve_book(filename):
+    """Returns the full path of a PDF inside BOOKS_FOLDER, or None if it isn't there."""
+    if not filename or os.path.basename(filename) != filename or not filename.lower().endswith('.pdf'):
+        return None
+    path = os.path.join(BOOKS_FOLDER, filename)
+    return path if os.path.isfile(path) else None
+
+
+def book_title(filename):
+    """'Crime-and-Punishment.pdf' -> 'Crime and Punishment'."""
+    stem = os.path.splitext(filename)[0]
+    return " ".join(stem.replace('_', ' ').replace('-', ' ').split()) or stem
+
+
+def book_slug(filename):
+    """Folder-safe name for a book's audio cache."""
+    return re.sub(r'[^A-Za-z0-9_-]+', '_', os.path.splitext(filename)[0]).strip('_') or 'book'
+
+
+def edge_key(line):
+    """Ignores digits and spacing so footers like 'Publisher ✦ 13 ✦' match from page to page."""
+    return " ".join(re.sub(r'\d+', '#', line).split())
+
+
+def find_boilerplate(pdf_path):
+    """Finds lines repeated at the top/bottom of most pages (running titles, author names...)."""
+    key = (pdf_path, os.path.getmtime(pdf_path))
+    with _boilerplate_lock:
+        if key not in _boilerplate_cache:
+            counts = Counter()
+            with fitz.open(pdf_path) as doc:
+                # A sample of ~40 pages is plenty to spot a running header, and much faster.
+                # The step is odd so both left- and right-hand page headers get sampled.
+                sample = range(0, len(doc), max(1, len(doc) // 40) | 1)
+                for i in sample:
+                    text = doc[i].get_text("text", sort=True)
+                    lines = [l.strip() for l in text.splitlines() if l.strip()]
+                    counts.update({edge_key(l) for l in lines[:2] + lines[-2:]})
+            threshold = max(5, len(sample) * 0.3)
+            _boilerplate_cache[key] = {line for line, n in counts.items() if n >= threshold}
+        return _boilerplate_cache[key]
 
 
 def clean_text_for_tts(text):
-    """Clean PDF whitespace/newlines so TTS reads naturally."""
+    """Cleans up PDF formatting so Edge-TTS reads it naturally."""
+    text = re.sub(r'(\w)-\n(?=[a-z])', r'\1', text)  # Re-join words hyphenated across lines
+    text = re.sub(r'(?:\.\s+){5,}\.?', ' ', text)     # Table-of-contents dot leaders
     text = text.replace('\n', ' ').replace('\r', ' ')
     text = " ".join(text.split())
     return text
 
 
+def page_text_for_tts(pdf_path, page_num):
+    boilerplate = find_boilerplate(pdf_path)
+    with fitz.open(pdf_path) as doc:
+        raw = doc[page_num - 1].get_text("text", sort=True)
+
+    # Strip running headers/footers and bare page numbers so they aren't read aloud every page
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    while lines and (edge_key(lines[0]) in boilerplate or PAGE_NUMBER_RE.match(lines[0])):
+        lines.pop(0)
+    while lines and (edge_key(lines[-1]) in boilerplate or PAGE_NUMBER_RE.match(lines[-1])):
+        lines.pop()
+    return clean_text_for_tts("\n".join(lines))
+
+
+def unique_book_path(filename):
+    """Avoids overwriting a different book that happens to share a filename."""
+    stem, ext = os.path.splitext(filename)
+    candidate, n = filename, 2
+    while os.path.exists(os.path.join(BOOKS_FOLDER, candidate)):
+        candidate = f"{stem} ({n}){ext}"
+        n += 1
+    return candidate
+
+
+# Google Translate allows ~5 requests a second, so requests are spaced out
+_translate_lock = threading.Lock()
+_last_translate = 0.0
+TRANSLATE_GAP = 0.3  # seconds between requests
+
+
+def _translate_chunk(text, target_lang):
+    global _last_translate
+    for attempt in range(3):
+        with _translate_lock:
+            wait = _last_translate + TRANSLATE_GAP - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            _last_translate = time.monotonic()
+        try:
+            return GoogleTranslator(source='auto', target=target_lang).translate(text) or text
+        except Exception as e:
+            print(f"[Translation error] {e}")
+            time.sleep(1.5 * (attempt + 1))
+    print("[Translation] Giving up on this part — keeping the original text")
+    return text
+
+
 def translate_text(text, target_lang, chunk_size=4500):
-    """
-    Translate text to the specified target language via Google Translate.
-    Splits into chunks (GoogleTranslator has a ~5000-char limit per call)
-    and processes them in parallel for speed.
-    """
+    """Translates a page via Google Translate. Usually one request per page; long pages
+    are split on sentence boundaries (the service has a ~5000-char limit per call)."""
     if not text.strip():
         return text
-
-    # Split on sentence boundaries to keep chunks coherent
-    chunks  = []
-    current = ""
-    for sentence in text.replace('. ', '.|').split('|'):
-        if len(current) + len(sentence) < chunk_size:
-            current += sentence + ' '
+    chunks, current = [], ''
+    for sentence in re.split(r'(?<=[.!?…])\s+', text):
+        if current and len(current) + len(sentence) + 1 > chunk_size:
+            chunks.append(current)
+            current = sentence
         else:
-            if current:
-                chunks.append(current.strip())
-            current = sentence + ' '
+            current = f"{current} {sentence}".strip()
     if current:
-        chunks.append(current.strip())
+        chunks.append(current)
+    return ' '.join(_translate_chunk(chunk, target_lang) for chunk in chunks)
 
-    # Translate chunks in parallel using a thread pool
-    translated_parts = [""] * len(chunks)
 
-    def translate_chunk(index, chunk_text):
+# =============================================
+#  TTS ENGINE
+# =============================================
+def split_into_segments(text, size=SEGMENT_CHARS):
+    """Breaks page text into sentence-aligned sections of roughly `size` characters.
+    The first section is shorter so playback can start sooner."""
+    sentences = re.split(r'(?:(?<=[.!?…])|(?<=[.!?…][”"’)]))\s+', text)
+    pieces = []
+    for sentence in sentences:
+        # Very long "sentences" (contents pages, run-ons) get cut at a space
+        while len(sentence) > size * 2:
+            cut = sentence.rfind(' ', size // 2, size) + 1 or size
+            pieces.append(sentence[:cut].strip())
+            sentence = sentence[cut:]
+        pieces.append(sentence.strip())
+
+    segments, current = [], ''
+    for piece in filter(None, pieces):
+        limit = size if segments else size // 2
+        if current and len(current) + 1 + len(piece) > limit:
+            segments.append(current)
+            current = piece
+        else:
+            current = f"{current} {piece}".strip()
+    if current:
+        segments.append(current)
+    return segments
+
+
+class _ConnectionSlots:
+    """Caps parallel requests to the voice service. Pages being listened to go first, and
+    background preloads get one connection each so they never crowd them out."""
+
+    def __init__(self, limit):
+        self.free = limit
+        self.waiting = []  # (job, order, future)
+        self.order = 0
+
+    async def acquire(self, job):
+        self.order += 1
+        future = asyncio.get_running_loop().create_future()
+        self.waiting.append((job, self.order, future))
+        self.dispatch()
+        await future
+
+    def release(self, job):
+        job.active -= 1
+        self.free += 1
+        self.dispatch()
+
+    def dispatch(self):
+        """Hands free connections to waiting sections, most urgent first."""
+        self.waiting = [w for w in self.waiting if not w[2].done()]
+        while self.free > 0:
+            ready = [w for w in self.waiting if w[0].active < w[0].max_active]
+            if not ready:
+                return
+            nxt = min(ready, key=lambda w: (w[0].priority, w[1]))
+            self.waiting.remove(nxt)
+            self.free -= 1
+            nxt[0].active += 1
+            nxt[2].set_result(None)
+
+
+class PageAudioJob:
+    """Synthesizes one page; any number of listeners can stream it while it's being made."""
+
+    def __init__(self, text, voice, audio_path, priority, translate_to=''):
+        self.text = text
+        self.voice = voice
+        self.audio_path = audio_path
+        self.priority = priority  # Lower runs sooner; >= 0 means it's only a preload
+        self.translate_to = translate_to
+        self.active = 0           # Sections currently being synthesized
+        # Filled in by run() once the text is ready (after translating, if asked)
+        self.segments = None
+        self.parts = []
+        self.part_done = []
+        self.error = None
+        self.cond = threading.Condition()
+
+    def _prepare(self, segments):
+        with self.cond:
+            self.parts = [bytearray() for _ in segments]
+            self.part_done = [False] * len(segments)
+            self.segments = segments
+            self.cond.notify_all()
+
+    @property
+    def max_active(self):
+        return 1 if self.priority >= 0 else MAX_TTS_CONNECTIONS
+
+    def stream(self):
+        """Yields the page's MP3 bytes in order, waiting on sections that aren't ready yet."""
+        with self.cond:
+            while self.segments is None and not self.error:
+                self.cond.wait(timeout=30)
+        index, offset = 0, 0
+        while index < len(self.parts):
+            with self.cond:
+                while (len(self.parts[index]) == offset and not self.part_done[index]
+                       and not self.error):
+                    self.cond.wait(timeout=30)
+                chunk = bytes(self.parts[index][offset:])
+                finished = self.part_done[index]
+                failed = self.error is not None
+            if chunk:
+                offset += len(chunk)
+                yield chunk
+            elif finished:
+                index, offset = index + 1, 0
+            elif failed:
+                return
+
+    async def _make_segment(self, i):
+        for attempt in range(3):
+            if self.error:
+                return
+            await _slots.acquire(self)
+            try:
+                async for message in edge_tts.Communicate(self.segments[i], self.voice).stream():
+                    if message["type"] == "audio":
+                        with self.cond:
+                            self.parts[i] += message["data"]
+                            self.cond.notify_all()
+                with self.cond:
+                    self.part_done[i] = True
+                    self.cond.notify_all()
+                return
+            except Exception as e:
+                # Only retry if nothing was sent yet, otherwise listeners would hear it twice
+                if self.parts[i] or attempt == 2:
+                    app.logger.error("TTS failed for %s: %s", self.audio_path, e)
+                    with self.cond:
+                        self.error = str(e) or type(e).__name__
+                        self.cond.notify_all()
+                    return
+            finally:
+                _slots.release(self)
+            await asyncio.sleep(2 * (attempt + 1))
+
+    async def run(self):
         try:
-            translator = GoogleTranslator(source='auto', target=target_lang)
-            return index, translator.translate(chunk_text)
+            text = self.text
+            if self.translate_to:
+                text = await asyncio.to_thread(translate_text, text, self.translate_to)
+            self._prepare(split_into_segments(text) or [text])
         except Exception as e:
-            print(f"[Translation error] {e} — keeping original chunk")
-            return index, chunk_text  # graceful fallback
+            app.logger.error("Couldn't prepare %s: %s", self.audio_path, e)
+            with self.cond:
+                self.error = str(e) or type(e).__name__
+                self.cond.notify_all()
+            return
+        await asyncio.gather(*(self._make_segment(i) for i in range(len(self.segments))))
+        if not self.error:
+            # Save the finished page so it plays (and seeks) instantly next time
+            os.makedirs(os.path.dirname(self.audio_path), exist_ok=True)
+            temp_path = self.audio_path + '.part'
+            with open(temp_path, 'wb') as f:
+                for part in self.parts:
+                    f.write(part)
+            os.replace(temp_path, self.audio_path)
+            with _jobs_lock:
+                if _jobs.get(self.audio_path) is self:
+                    del _jobs[self.audio_path]
 
-    with ThreadPoolExecutor(max_workers=min(len(chunks), 6)) as executor:
-        futures = [
-            executor.submit(translate_chunk, i, chunk)
-            for i, chunk in enumerate(chunks)
-        ]
-        for future in as_completed(futures):
-            idx, result = future.result()
-            translated_parts[idx] = result
 
-    return ' '.join(translated_parts)
+# All synthesis runs on one background event loop
+_tts_loop = asyncio.new_event_loop()
+threading.Thread(target=_tts_loop.run_forever, daemon=True).start()
+_slots = _ConnectionSlots(MAX_TTS_CONNECTIONS)
 
 
+def audio_paths(filename, page_num, voice, translate_to=''):
+    slug = book_slug(filename)
+    audio_filename = f"page_{page_num}_{voice}_{translate_to or 'original'}.mp3"
+    return (os.path.join(AUDIO_FOLDER, slug, audio_filename),
+            url_for('static', filename=f'audio/{slug}/{audio_filename}'))
+
+
+def is_cached(audio_path):
+    return os.path.exists(audio_path) and os.path.getsize(audio_path) > 0
+
+
+def start_job(audio_path, text, voice, priority, translate_to=''):
+    """Returns the running job for this page, starting one if needed (failed jobs are retried)."""
+    with _jobs_lock:
+        job = _jobs.get(audio_path)
+        if job and not job.error:
+            if priority < job.priority:
+                # Someone's listening now: let it use more connections right away
+                job.priority = priority
+                _tts_loop.call_soon_threadsafe(_slots.dispatch)
+            return job
+        job = PageAudioJob(text, voice, audio_path, priority, translate_to)
+        _jobs[audio_path] = job
+    asyncio.run_coroutine_threadsafe(job.run(), _tts_loop)
+    return job
+
+
+def audio_request_args():
+    """Reads and validates the book / translation query parameters shared by the audio routes."""
+    filename = request.args.get('book', '')
+    translate_to = request.args.get('translate_to', '')
+    if translate_to not in LANGUAGE_CODES:
+        translate_to = ''
+    return filename, translate_to
+
+
+# =============================================
+#  PAGES & LIBRARY
+# =============================================
 @app.route('/')
 def index():
     return render_template('index.html')
 
 
+@app.route('/list_books')
+def list_books():
+    """Every PDF in the books folder, most recently read first."""
+    info = get_books_info()
+    books = []
+    for name in os.listdir(BOOKS_FOLDER):
+        path = os.path.join(BOOKS_FOLDER, name)
+        if not name.lower().endswith('.pdf') or not os.path.isfile(path):
+            continue
+        saved = info.get(name, {})
+        total = saved.get("total_pages")
+        if not total:
+            try:
+                with fitz.open(path) as doc:
+                    total = len(doc)
+            except Exception:
+                continue  # Not a readable PDF
+        books.append({
+            "filename": name,
+            "title": saved.get("title") or book_title(name),
+            "total_pages": total,
+            "last_page": saved.get("last_page") or 1,
+            "last_opened": saved.get("last_opened"),
+            "size_mb": round(os.path.getsize(path) / 1_048_576, 1),
+        })
+    books.sort(key=lambda b: b["title"].lower())
+    books.sort(key=lambda b: b["last_opened"] or "", reverse=True)
+    return jsonify({"folder": BOOKS_FOLDER, "books": books})
+
+
+@app.route('/book_file/<path:filename>')
+def book_file(filename):
+    return send_from_directory(BOOKS_FOLDER, filename, mimetype='application/pdf')
+
+
+@app.route('/open_book', methods=['POST'])
+def open_book():
+    filename = (request.get_json(silent=True) or {}).get('book', '')
+    pdf_path = resolve_book(filename)
+    if not pdf_path:
+        return jsonify({"error": "That book isn't in the books folder anymore."}), 404
+
+    try:
+        with fitz.open(pdf_path) as doc:
+            total = len(doc)
+    except Exception:
+        return jsonify({"error": "Couldn't read that PDF — it may be damaged."}), 400
+
+    # Keep a title saved earlier (e.g. the real name of a Gutenberg book)
+    title = get_books_info().get(filename, {}).get("title") or book_title(filename)
+    register_book(filename, title, total)
+    last_page, last_position = get_progress(filename)
+
+    return jsonify({
+        "filename": filename,
+        "title": title,
+        "total_pages": total,
+        "pdf_url": url_for('book_file', filename=filename),
+        "resume_page": min(max(last_page or 1, 1), total),
+        "resume_position": last_position or 0
+    })
+
+
 @app.route('/upload', methods=['POST'])
 def upload_file():
+    """Saves an uploaded PDF into the books folder so it stays in the library."""
     if 'file' not in request.files:
         return jsonify({"error": "No file part"}), 400
 
@@ -114,89 +477,109 @@ def upload_file():
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
 
-    if file:
-        for f in glob.glob(os.path.join(AUDIO_FOLDER, "*.mp3")):
-            os.remove(f)
+    name = secure_filename(file.filename) or 'book.pdf'
+    if not name.lower().endswith('.pdf'):
+        return jsonify({"error": "Only PDF files are supported"}), 400
 
-        filename       = "current_book.pdf"
-        original_title = os.path.splitext(file.filename)[0]
-        filepath       = os.path.join(UPLOAD_FOLDER, filename)
-        file.save(filepath)
+    # Same name and same size: it's the book we already have, so just reuse it
+    existing = os.path.join(BOOKS_FOLDER, name)
+    file.stream.seek(0, os.SEEK_END)
+    size = file.stream.tell()
+    file.stream.seek(0)
+    if os.path.isfile(existing) and os.path.getsize(existing) == size:
+        return jsonify({"filename": name})
 
-        doc   = fitz.open(filepath)
-        total = len(doc)
-
-        session_data["pdf_path"]     = filepath
-        session_data["total_pages"]  = total
-        session_data["current_book"] = filename
-
-        register_book(filename, original_title, total)
-        last_page, last_position = get_progress(filename)
-
-        return jsonify({
-            "message":         "Upload successful",
-            "total_pages":     total,
-            "pdf_url":         url_for('static', filename=f'uploads/{filename}'),
-            "title":           original_title,
-            "resume_page":     last_page,
-            "resume_position": last_position
-        })
+    name = unique_book_path(name)
+    file.save(os.path.join(BOOKS_FOLDER, name))
+    return jsonify({"filename": name})
 
 
+@app.route('/open_books_folder', methods=['POST'])
+def open_books_folder():
+    """Opens the books folder in the file explorer so PDFs can be dropped in."""
+    if sys.platform == 'win32':
+        os.startfile(BOOKS_FOLDER)
+    elif sys.platform == 'darwin':
+        subprocess.Popen(['open', BOOKS_FOLDER])
+    else:
+        subprocess.Popen(['xdg-open', BOOKS_FOLDER])
+    return jsonify({"ok": True})
+
+
+# =============================================
+#  AUDIO
+# =============================================
 @app.route('/get_audio/<int:page_num>/<voice>')
 def get_audio(page_num, voice):
-    """
-    Generate TTS audio for a page.
-    Optional query param: ?translate_to=<lang_code>
-    If translate_to is omitted, reads the original text (fast path).
-    """
-    if not session_data["pdf_path"]:
-        return jsonify({"error": "No PDF uploaded"}), 400
+    """Returns where to play a page from, starting synthesis in the background if needed.
+    Optional query param: ?translate_to=<lang_code> reads the page translated."""
+    filename, translate_to = audio_request_args()
+    pdf_path = resolve_book(filename)
+    if not pdf_path:
+        return jsonify({"error": "No book open"}), 400
+    if not VOICE_RE.match(voice):
+        return jsonify({"error": "Unknown voice"}), 400
 
-    translate_to = request.args.get('translate_to', '')
-    lang_tag = translate_to if translate_to else 'original'
+    audio_path, cached_url = audio_paths(filename, page_num, voice, translate_to)
 
-    # Cache key includes the target language so translated and
-    # non-translated audio don't collide
-    audio_filename = f"page_{page_num}_{voice}_{lang_tag}.mp3"
-    audio_path     = os.path.join(AUDIO_FOLDER, audio_filename)
+    # Serve from cache if already generated (empty files are failed runs, so redo them)
+    if is_cached(audio_path):
+        return jsonify({"audio_url": cached_url, "complete": True})
 
-    # Serve cached MP3 immediately
-    if os.path.exists(audio_path):
-        return jsonify({"audio_url": url_for('static', filename=f'audio/{audio_filename}')})
+    with fitz.open(pdf_path) as doc:
+        if not 1 <= page_num <= len(doc):
+            return jsonify({"error": f"Page {page_num} doesn't exist"}), 404
+    text = page_text_for_tts(pdf_path, page_num)
 
-    doc  = fitz.open(session_data["pdf_path"])
-    text = doc[page_num - 1].get_text("text", sort=True)
-    text = clean_text_for_tts(text)
-
+    # Blank/image-only page detection — skip rather than generating silence
     if len(text.strip()) < 20:
         return jsonify({"skip": True, "reason": "blank_or_image_page"})
 
-    # Only translate if a target language was requested
-    if translate_to:
-        print(f"[Page {page_num}] Translating {len(text)} chars to {translate_to}…")
-        text = translate_text(text, translate_to)
-        print(f"[Page {page_num}] Done ({len(text)} chars). Generating TTS…")
-    else:
-        print(f"[Page {page_num}] No translation — generating TTS for original text ({len(text)} chars)…")
-
-    # Generate TTS audio
-    async def generate_tts():
-        communicate = edge_tts.Communicate(text, voice)
-        await communicate.save(audio_path)
-
-    asyncio.run(generate_tts())
-
-    return jsonify({"audio_url": url_for('static', filename=f'audio/{audio_filename}')})
+    # Pages being listened to now jump ahead of preloads (most recent request first)
+    priority = 0 if request.args.get('preload') else -time.time()
+    start_job(audio_path, text, voice, priority, translate_to)
+    return jsonify({
+        "audio_url": url_for('stream_audio', page_num=page_num, voice=voice,
+                             book=filename, translate_to=translate_to or None),
+        "complete": False
+    })
 
 
-@app.route('/get_toc')
-def get_toc():
-    if not session_data["pdf_path"]:
-        return jsonify([])
-    doc = fitz.open(session_data["pdf_path"])
-    toc = doc.get_toc()
-    return jsonify([{"level": item[0], "title": item[1], "page": item[2]} for item in toc])
+@app.route('/stream_audio/<int:page_num>/<voice>')
+def stream_audio(page_num, voice):
+    """Plays a page while it's still being synthesized."""
+    filename, translate_to = audio_request_args()
+    if not resolve_book(filename) or not VOICE_RE.match(voice):
+        return "Not found", 404
+
+    audio_path, _ = audio_paths(filename, page_num, voice, translate_to)
+    if is_cached(audio_path):
+        return send_file(audio_path, mimetype='audio/mpeg', conditional=True)
+
+    with _jobs_lock:
+        job = _jobs.get(audio_path)
+    if not job:
+        return "This page isn't being generated", 404
+    return Response(job.stream(), mimetype='audio/mpeg', headers={"Cache-Control": "no-store"})
+
+
+@app.route('/audio_status/<int:page_num>/<voice>')
+def audio_status(page_num, voice):
+    """Lets the player check a page was read in full before moving on."""
+    filename, translate_to = audio_request_args()
+    if not resolve_book(filename) or not VOICE_RE.match(voice):
+        return jsonify({"ok": False, "error": "No book open"})
+
+    audio_path, _ = audio_paths(filename, page_num, voice, translate_to)
+    with _jobs_lock:
+        job = _jobs.get(audio_path)
+    if job and job.error:
+        return jsonify({
+            "ok": False,
+            "error": "The voice service stopped responding. Check your internet connection, "
+                     "or run: pip install --upgrade edge-tts"
+        })
+    return jsonify({"ok": True})
 
 
 @app.route('/get_voices')
@@ -207,15 +590,9 @@ def get_voices():
            /get_voices              →  all voices
     """
     locale_filter = request.args.get('locale', '')
-
-    async def fetch():
-        return await edge_tts.list_voices()
-
-    voices = asyncio.run(fetch())
-
+    voices = asyncio.run(edge_tts.list_voices())
     if locale_filter:
         voices = [v for v in voices if v['Locale'].startswith(locale_filter)]
-
     return jsonify(voices)
 
 
@@ -225,22 +602,36 @@ def get_supported_languages():
     return jsonify(SUPPORTED_LANGUAGES)
 
 
+# =============================================
+#  TOC, PROGRESS & BOOKMARKS
+# =============================================
+@app.route('/get_toc')
+def get_toc():
+    """Returns the PDF's built-in Table of Contents / outline."""
+    pdf_path = resolve_book(request.args.get('book', ''))
+    if not pdf_path:
+        return jsonify([])
+    with fitz.open(pdf_path) as doc:
+        toc = doc.get_toc()  # [[level, title, page_number], ...]
+    return jsonify([{"level": item[0], "title": item[1], "page": item[2]} for item in toc])
+
+
 @app.route('/save_progress', methods=['POST'])
 def save_progress_route():
-    if not session_data["current_book"]:
+    data = request.get_json(silent=True) or {}
+    if not resolve_book(data.get('book', '')):
         return jsonify({"ok": False})
-    data = request.json
-    save_progress(session_data["current_book"], data['page'], data['position'])
+    save_progress(data['book'], data['page'], data['position'])
     return jsonify({"ok": True})
 
 
 @app.route('/add_bookmark', methods=['POST'])
 def add_bookmark_route():
-    if not session_data["current_book"]:
+    data = request.get_json(silent=True) or {}
+    if not resolve_book(data.get('book', '')):
         return jsonify({"ok": False})
-    data = request.json
     add_bookmark(
-        session_data["current_book"],
+        data['book'],
         data['page'],
         data['position'],
         data.get('note', '')
@@ -250,9 +641,10 @@ def add_bookmark_route():
 
 @app.route('/get_bookmarks')
 def get_bookmarks_route():
-    if not session_data["current_book"]:
+    filename = request.args.get('book', '')
+    if not resolve_book(filename):
         return jsonify([])
-    rows = get_bookmarks(session_data["current_book"])
+    rows = get_bookmarks(filename)
     return jsonify([
         {"id": r[0], "page": r[1], "position": r[2], "note": r[3], "date": r[4]}
         for r in rows
@@ -265,8 +657,9 @@ def delete_bookmark_route(bookmark_id):
     return jsonify({"ok": True})
 
 
-# ── Project Gutenberg Integration ─────────────────────────────────────
-
+# =============================================
+#  PROJECT GUTENBERG
+# =============================================
 GUTENDEX_API = 'https://gutendex.com/books'
 
 
@@ -327,13 +720,13 @@ def text_to_pdf(text, title, filepath, chars_per_page=3000):
     """
     # 1. Swap fancy Unicode typography for standard ASCII equivalents
     replacements = {
-        '—': '--', '–': '-',    
-        '“': '"', '”': '"',     
-        '‘': "'", '’': "'",     
-        '…': '...',             
-        '\u200B': '',           
+        '—': '--', '–': '-',
+        '“': '"', '”': '"',
+        '‘': "'", '’': "'",
+        '…': '...',
+        '​': '',
         '\xad': '-',
-        '\t': '    '  # <-- FIX 1: Convert tabs to spaces. Tabs break fpdf2's width calculations.
+        '\t': '    '  # Tabs break fpdf2's width calculations
     }
     for fancy, basic in replacements.items():
         text = text.replace(fancy, basic)
@@ -349,11 +742,10 @@ def text_to_pdf(text, title, filepath, chars_per_page=3000):
 
     pdf.add_page()
 
-    # FIX 2: Protect the Title page. 
-    # Font size 24 means even shorter long-words can exceed the page width and crash.
+    # Protect the title page: at font size 24 even shorter long-words can exceed the page width
     safe_title_words = []
     for word in title.split(' '):
-        if len(word) > 20: 
+        if len(word) > 20:
             chunks = [word[i:i+20] for i in range(0, len(word), 20)]
             safe_title_words.append(' '.join(chunks))
         else:
@@ -371,38 +763,32 @@ def text_to_pdf(text, title, filepath, chars_per_page=3000):
     # Body pages
     pdf.set_font('Helvetica', '', 11)
 
-    lines = text.splitlines()
-    for line in lines:
+    for line in text.splitlines():
         line = line.rstrip()
         if not line:
             pdf.ln(4)
         else:
-            # 3. THE NEW FIX: Now works perfectly because tabs are gone,
-            # meaning .split(' ') won't miss anything, while still preserving paragraph indents.
+            # Chunk huge "words" (URLs etc.) so they fit on a line, keeping paragraph indents
             safe_words = []
             for word in line.split(' '):
                 if len(word) > 50:
-                    # Chunk the massive word into 50-character bites separated by a space
                     chunks = [word[i:i+50] for i in range(0, len(word), 50)]
                     safe_words.append(' '.join(chunks))
                 else:
                     safe_words.append(word)
-            
-            safe_line = ' '.join(safe_words)
-            pdf.multi_cell(0, 5.5, safe_line)
+            pdf.multi_cell(0, 5.5, ' '.join(safe_words))
 
     pdf.output(filepath)
 
-    doc = fitz.open(filepath)
-    total = len(doc)
-    doc.close()
-    return total
+    with fitz.open(filepath) as doc:
+        return len(doc)
 
 
 @app.route('/gutenberg/download/<int:book_id>')
 def gutenberg_download(book_id):
     """
-    Download a book from Project Gutenberg, convert to PDF, and load it.
+    Download a book from Project Gutenberg, convert it to PDF and save it into the
+    books folder, so it stays in the library like any uploaded book.
     """
     try:
         # 1. Get book metadata from Gutendex
@@ -410,6 +796,12 @@ def gutenberg_download(book_id):
         meta = meta_resp.json()
         title = meta.get('title', f'Book {book_id}')
         formats = meta.get('formats', {})
+
+        stem = (secure_filename(title) or 'book')[:80]
+        filename = f'{stem}-pg{book_id}.pdf'
+        if resolve_book(filename):
+            # Downloaded before: reuse it (keeps reading progress)
+            return jsonify({'filename': filename})
 
         # 2. Find plain text URL
         text_url = None
@@ -431,33 +823,17 @@ def gutenberg_download(book_id):
         text_resp.encoding = 'utf-8'
         book_text = text_resp.text
 
-        # 4. Clear old audio cache
-        for f in glob.glob(os.path.join(AUDIO_FOLDER, '*.mp3')):
-            os.remove(f)
-
-        # 5. Convert to PDF
-        filename = 'current_book.pdf'
-        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        # 4. Convert to PDF (written to a temp name so a failed run leaves no broken book)
+        filepath = os.path.join(BOOKS_FOLDER, filename)
+        temp_path = filepath + '.part'
         print(f'[Gutenberg] Converting {len(book_text)} chars to PDF…')
-        total = text_to_pdf(book_text, title, filepath)
+        total = text_to_pdf(book_text, title, temp_path)
+        os.replace(temp_path, filepath)
         print(f'[Gutenberg] Done — {total} pages.')
 
-        # 6. Register in session and database
-        session_data['pdf_path']     = filepath
-        session_data['total_pages']  = total
-        session_data['current_book'] = filename
-
+        # 5. Save the real title so the library shows it
         register_book(filename, title, total)
-        last_page, last_position = get_progress(filename)
-
-        return jsonify({
-            'message':         'Book loaded from Project Gutenberg',
-            'total_pages':     total,
-            'pdf_url':         url_for('static', filename=f'uploads/{filename}'),
-            'title':           title,
-            'resume_page':     last_page,
-            'resume_position': last_position
-        })
+        return jsonify({'filename': filename})
 
     except Exception as e:
         print(f'[Gutenberg download error] {e}')

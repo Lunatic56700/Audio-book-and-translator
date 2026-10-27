@@ -438,6 +438,18 @@
             cursor: pointer;
         }
         .lib-load-more:hover { text-decoration: underline; }
+
+        /* My Books (books folder) */
+        #my-books-list { display: flex; flex-direction: column; gap: 0.4rem; max-height: 340px; overflow-y: auto; }
+        .lib-card.current { border-color: var(--accent); }
+        .book-icon {
+            width: 36px; height: 48px; flex-shrink: 0;
+            display: flex; align-items: center; justify-content: center;
+            border-radius: 4px; background: var(--accent-light); font-size: 1.2rem;
+        }
+        .book-progress { height: 3px; background: var(--panel-border); border-radius: 2px; margin-top: 0.3rem; overflow: hidden; }
+        .book-progress div { height: 100%; background: var(--accent); }
+        #books-folder-path { word-break: break-all; }
     </style>
 </head>
 <body>
@@ -461,7 +473,7 @@
         <div id="pdf-placeholder">
             <div style="font-size:5rem">📚</div>
             <p style="font-size:1rem;color:#bbb">No book loaded</p>
-            <p style="font-size:0.82rem;color:#777">Upload a PDF to listen as an audiobook</p>
+            <p style="font-size:0.82rem;color:#777">Pick a book in the 📚 Library tab, or upload a PDF to listen as an audiobook</p>
         </div>
         <canvas id="pdf-canvas"></canvas>
     </div>
@@ -512,13 +524,14 @@
                  onclick="document.getElementById('pdf-upload').click()">
                 <div class="dz-icon">📥</div>
                 <strong id="drop-label">Drop PDF here or click to browse</strong>
-                <p>Supports any PDF document</p>
+                <p>Uploaded books are saved to your library</p>
                 <input type="file" id="pdf-upload" accept="application/pdf"
                        style="display:none" onchange="uploadFromInput()">
             </div>
             <div id="resume-banner">
                 <span id="resume-text">Resume from page ?</span>
                 <button onclick="resumeReading()">Resume</button>
+                <button onclick="startOver()">Start over</button>
                 <button onclick="document.getElementById('resume-banner').style.display='none'">✕</button>
             </div>
         </div>
@@ -566,7 +579,7 @@
         <div class="divider"></div>
 
         <div class="section">
-            <div id="status">⏳ Waiting for PDF upload…</div>
+            <div id="status">⏳ Pick a book from the Library or upload a PDF…</div>
             <div id="stats-box">
                 🕐 <strong id="stat-time">0m 0s</strong> listened &nbsp;·&nbsp;
                 📖 <strong id="stat-pages">0 / 0</strong> pages &nbsp;·&nbsp;
@@ -651,6 +664,18 @@
     <!-- LIBRARY TAB -->
     <div class="tab-panel" id="panel-library">
         <div class="section">
+            <span class="section-label">📂 My Books</span>
+            <div class="btn-row">
+                <button class="btn btn-secondary" onclick="openBooksFolder()">📂 Open Books Folder</button>
+                <button class="btn btn-secondary" onclick="loadLibrary()">🔄 Refresh</button>
+            </div>
+            <div id="my-books-list">
+                <p class="list-empty">Loading your books…</p>
+            </div>
+            <p class="lib-card-meta" id="books-folder-path"></p>
+        </div>
+        <div class="divider"></div>
+        <div class="section">
             <span class="section-label">📚 Project Gutenberg — Free Books</span>
             <div class="lib-search-row">
                 <input type="text" id="lib-search-input" placeholder="Search books (title or author)…"
@@ -670,6 +695,10 @@
 pdfjsLib.GlobalWorkerOptions.workerSrc =
     'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
+const PRELOAD_AHEAD = 3;   // Pages prepared in the background ahead of the one playing
+
+let currentBook     = '';   // Filename inside the books folder
+let currentTitle    = '';
 let currentPage     = 1;
 let totalPages      = 0;
 let pdfUrl          = "";
@@ -678,13 +707,22 @@ let pdfDoc          = null;
 let pdfScale        = 1.5;
 let resumePage      = 1;
 let resumePosition  = 0;
-let pendingJump     = false;
+let loadToken       = 0;    // Ignores answers for pages the user already moved away from
+let pageStarted     = false; // True once audio for currentPage has been requested
 let sleepTimer      = null;
 let sleepEndTime    = null;
 let sleepInterval   = null;
 let pagesRead       = new Set();
 let totalListenSecs = 0;
 let supportedLangs  = [];
+
+const player = document.getElementById('audio-player');
+const sleep  = ms => new Promise(r => setTimeout(r, ms));
+
+function esc(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
 
 // Theme
 function toggleDark() {
@@ -783,7 +821,115 @@ async function refreshVoices() {
     await updateVoicesForCurrentLang();
 }
 
-// ── Drag & Drop ──────────────────────────────────────────────────────
+// ── My Books (the books folder) ──────────────────────────────────────
+async function loadLibrary() {
+    const list = document.getElementById('my-books-list');
+    try {
+        const data = await (await fetch('/list_books')).json();
+        document.getElementById('books-folder-path').innerText =
+            `Books folder: ${data.folder} — drop PDFs in here and press Refresh.`;
+        renderLibrary(data.books);
+        return data.books;
+    } catch {
+        list.innerHTML = '<p class="list-empty">❌ Couldn\'t load your books. Is Flask running?</p>';
+        return [];
+    }
+}
+
+function renderLibrary(books) {
+    const list = document.getElementById('my-books-list');
+    if (!books.length) {
+        list.innerHTML = '<p class="list-empty">No books yet. Upload a PDF on the ▶ Play tab, ' +
+                         'download one from Gutenberg below, or drop PDFs into the books folder.</p>';
+        return;
+    }
+    list.innerHTML = '';
+    books.forEach(b => {
+        const pct  = b.total_pages ? Math.round(((b.last_page - 1) / b.total_pages) * 100) : 0;
+        const card = document.createElement('div');
+        card.className = 'lib-card' + (b.filename === currentBook ? ' current' : '');
+        card.onclick = () => { showTab('play'); openBook(b.filename, true); };
+        card.innerHTML = `
+            <div class="book-icon">📖</div>
+            <div class="lib-card-info">
+                <div class="lib-card-title" title="${esc(b.title)}">${esc(b.title)}</div>
+                <div class="lib-card-author">${(b.last_opened || b.last_page > 1) ? `Page ${b.last_page} of ${b.total_pages}` : `${b.total_pages} pages · not started`}</div>
+                <div class="lib-card-meta">${b.size_mb} MB${b.filename === currentBook ? ' · now reading' : ''}</div>
+                <div class="book-progress"><div style="width:${pct}%"></div></div>
+            </div>`;
+        list.appendChild(card);
+    });
+}
+
+async function openBooksFolder() {
+    try { await fetch('/open_books_folder', { method: 'POST' }); } catch {}
+}
+
+/**
+ * Opens a book from the books folder.
+ * autoplay = true continues from where it was left off;
+ * false just shows that page with a "Resume" button (used when the app starts).
+ */
+async function openBook(filename, autoplay) {
+    saveProgressNow();
+    setStatus('⏳ Opening book…');
+    const resp = await fetch('/open_book', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ book: filename })
+    });
+    const data = await resp.json();
+    if (data.error) { setStatus('❌ ' + data.error); loadLibrary(); return; }
+
+    loadToken++;
+    player.pause();
+    player.removeAttribute('src');
+    pageStarted = false;
+    currentBook  = data.filename;
+    currentTitle = data.title;
+    totalPages   = data.total_pages;
+    pdfUrl       = data.pdf_url;
+    preloadedPages.clear(); pagesRead.clear(); totalListenSecs = 0;
+    document.title = `${data.title} — Audiobook Player`;
+    document.getElementById('total-pages').innerText = totalPages;
+    document.getElementById('drop-label').innerText  = data.title;
+    document.getElementById('page-input').max        = totalPages;
+    document.getElementById('resume-banner').style.display = 'none';
+    updateStats();
+
+    await initPDFJS(pdfUrl);
+    loadTOC();
+    loadBookmarks();
+    loadLibrary();
+
+    resumePage     = data.resume_page || 1;
+    resumePosition = data.resume_position || 0;
+    const hasProgress = resumePage > 1 || resumePosition > 0;
+
+    if (autoplay) {
+        loadPage(resumePage, hasProgress ? resumePosition : 0);
+        if (hasProgress) setStatus(`↩ Continuing from page ${resumePage}…`);
+    } else {
+        // Just show where they were; browsers block sound until the user clicks anyway
+        showPage(resumePage);
+        if (hasProgress) {
+            document.getElementById('resume-text').innerText = `Continue "${data.title}" from page ${resumePage}`;
+            document.getElementById('resume-banner').style.display = 'flex';
+        }
+        setStatus(`📖 "${data.title}" is ready — press play or Resume.`);
+    }
+}
+
+function resumeReading() {
+    document.getElementById('resume-banner').style.display = 'none';
+    loadPage(resumePage, resumePosition);
+}
+
+function startOver() {
+    document.getElementById('resume-banner').style.display = 'none';
+    loadPage(1);
+}
+
+// ── Drag & Drop / Upload ─────────────────────────────────────────────
 function handleDragOver(e) { e.preventDefault(); document.getElementById('drop-zone').classList.add('drag-over'); }
 function handleDragLeave(e) { document.getElementById('drop-zone').classList.remove('drag-over'); }
 function handleDrop(e) {
@@ -794,14 +940,14 @@ function handleDrop(e) {
     else alert('Please drop a PDF file.');
 }
 function uploadFromInput() {
-    const file = document.getElementById('pdf-upload').files[0];
+    const input = document.getElementById('pdf-upload');
+    const file = input.files[0];
+    input.value = '';  // Lets the same file be picked again later
     if (file) uploadFile(file);
 }
 
 async function uploadFile(file) {
-    setStatus('⏳ Uploading and parsing…');
-    preloadedPages.clear(); pagesRead.clear(); totalListenSecs = 0; updateStats();
-
+    setStatus('⏳ Uploading…');
     const formData = new FormData();
     formData.append("file", file);
 
@@ -809,35 +955,11 @@ async function uploadFile(file) {
         const resp = await fetch('/upload', { method: 'POST', body: formData });
         const data = await resp.json();
         if (data.error) { setStatus('❌ ' + data.error); return; }
-
-        totalPages = data.total_pages;
-        pdfUrl     = data.pdf_url;
-        document.getElementById('total-pages').innerText = totalPages;
-        document.getElementById('drop-label').innerText  = data.title || file.name;
-        document.getElementById('page-input').max        = totalPages;
-
-        await initPDFJS(pdfUrl);
-        loadTOC();
-        loadBookmarks();
-
-        if (data.resume_page && data.resume_page > 1) {
-            resumePage     = data.resume_page;
-            resumePosition = data.resume_position || 0;
-            document.getElementById('resume-text').innerText = `Resume from page ${resumePage}`;
-            document.getElementById('resume-banner').style.display = 'flex';
-            loadPage(1);
-        } else {
-            loadPage(1);
-        }
+        // Already-known books pick up where they were left off
+        await openBook(data.filename, true);
     } catch (err) {
         setStatus('❌ Upload failed. Is Flask running on port 5000?');
     }
-}
-
-function resumeReading() {
-    document.getElementById('resume-banner').style.display = 'none';
-    pendingJump = true;
-    loadPage(resumePage);
 }
 
 // ── PDF.js ───────────────────────────────────────────────────────────
@@ -884,62 +1006,91 @@ async function searchText() {
 }
 
 // ── Page loading ─────────────────────────────────────────────────────
-async function loadPage(pageNum) {
-    if (pageNum < 1 || pageNum > totalPages) return;
+function audioQuery(extra = '') {
+    const translateTo = getTranslateLang();
+    return `?book=${encodeURIComponent(currentBook)}` +
+           (translateTo ? `&translate_to=${encodeURIComponent(translateTo)}` : '') + extra;
+}
+
+async function fetchAudio(page, preload = false) {
+    const voice = document.getElementById('voice-select').value;
+    const resp  = await fetch(`/get_audio/${page}/${voice}` + audioQuery(preload ? '&preload=1' : ''));
+    return resp.json();
+}
+
+async function audioStatus(page) {
+    const voice = document.getElementById('voice-select').value;
+    try { return await (await fetch(`/audio_status/${page}/${voice}` + audioQuery())).json(); }
+    catch { return { ok: true }; }
+}
+
+function showPage(pageNum) {
     currentPage = pageNum;
     document.getElementById('page-input').value = currentPage;
     renderPage(currentPage);
     updateProgress();
+}
+
+function describeLang() {
+    const translateTo = getTranslateLang();
+    if (!translateTo) return '';
+    const info = supportedLangs.find(l => l.code === translateTo);
+    return info ? info.name : translateTo;
+}
+
+/**
+ * Plays a page. Pages are made in short sections on the server and streamed as they
+ * arrive, so audio starts within a second or two instead of waiting for the whole page.
+ * position (seconds) continues part-way through the page (resume / bookmarks).
+ */
+async function loadPage(pageNum, position = 0) {
+    if (!currentBook || pageNum < 1 || pageNum > totalPages) return;
+    const token = ++loadToken;
+    showPage(pageNum);
+    pageStarted = true;
     pagesRead.add(currentPage);
     updateStats();
+    saveProgressNow(position);
 
-    const voice = document.getElementById('voice-select').value;
-    const translateTo = getTranslateLang();
-
-    if (translateTo) {
-        const langInfo = supportedLangs.find(l => l.code === translateTo);
-        setStatus(`🌐 Translating & generating audio for page ${currentPage} → ${langInfo ? langInfo.name : translateTo}…`);
-    } else {
-        setStatus(`🔊 Loading audio for page ${currentPage}…`);
-    }
-
-    let url = `/get_audio/${currentPage}/${voice}`;
-    if (translateTo) url += `?translate_to=${translateTo}`;
+    const lang = describeLang();
+    setStatus(lang ? `🌐 Preparing page ${currentPage} in ${lang}…` : `🔊 Loading audio for page ${currentPage}…`);
 
     try {
-        const resp = await fetch(url);
-        const data = await resp.json();
+        let data = await fetchAudio(currentPage);
+        if (token !== loadToken) return;
 
         if (data.skip) {
             setStatus(`⏭ Page ${currentPage} is blank/image — skipping…`);
-            setTimeout(() => changePage(1), 700);
+            await sleep(700);
+            if (token === loadToken && currentPage < totalPages) loadPage(currentPage + 1);
             return;
         }
+        if (data.error) { setStatus('❌ ' + data.error); return; }
 
-        if (data.audio_url) {
-            const player = document.getElementById('audio-player');
-            player.src   = data.audio_url;
-
-            if (pendingJump && resumePosition > 0) {
-                player.addEventListener('loadedmetadata', () => {
-                    player.currentTime = resumePosition;
-                    pendingJump = false;
-                }, { once: true });
+        // Jumping into the middle of a page needs the finished file (a live stream can't seek)
+        if (position > 0 && !data.complete) {
+            setStatus(`⏳ Preparing page ${currentPage} to continue where you left off…`);
+            while (!data.complete) {
+                await sleep(1500);
+                if (token !== loadToken) return;
+                const st = await audioStatus(currentPage);
+                if (!st.ok) { setStatus('❌ ' + st.error); return; }
+                data = await fetchAudio(currentPage);
+                if (token !== loadToken) return;
             }
-
-            player.playbackRate = parseFloat(document.getElementById('speed-slider').value);
-            player.play();
-
-            if (translateTo) {
-                const langInfo = supportedLangs.find(l => l.code === translateTo);
-                setStatus(`🔊 Playing page ${currentPage} of ${totalPages} (translated to ${langInfo ? langInfo.name : translateTo})`);
-            } else {
-                setStatus(`🔊 Playing page ${currentPage} of ${totalPages}`);
-            }
-            preloadNextPages(currentPage, 2);
         }
+
+        player.src = data.audio_url;
+        if (position > 0) {
+            player.addEventListener('loadedmetadata', () => { player.currentTime = position; }, { once: true });
+        }
+        player.playbackRate = parseFloat(document.getElementById('speed-slider').value);
+        player.play().catch(() => setStatus(`▶ Press play to start page ${currentPage}`));
+
+        setStatus(`🔊 Playing page ${currentPage} of ${totalPages}${lang ? ` (translated to ${lang})` : ''}`);
+        preloadNextPages(currentPage, PRELOAD_AHEAD);
     } catch {
-        setStatus('❌ Could not load audio.');
+        if (token === loadToken) setStatus('❌ Could not load audio.');
     }
 }
 
@@ -948,12 +1099,10 @@ function preloadNextPages(start, count) {
     const translateTo = getTranslateLang();
     for (let i = 1; i <= count; i++) {
         const t = start + i;
-        const key = `${t}_${voice}_${translateTo}`;
+        const key = `${currentBook}_${t}_${voice}_${translateTo}`;
         if (t <= totalPages && !preloadedPages.has(key)) {
             preloadedPages.add(key);
-            let url = `/get_audio/${t}/${voice}`;
-            if (translateTo) url += `?translate_to=${translateTo}`;
-            fetch(url).catch(() => {});
+            fetchAudio(t, true).catch(() => preloadedPages.delete(key));
         }
     }
 }
@@ -966,54 +1115,75 @@ function updateProgress() {
 
 // ── TOC ──────────────────────────────────────────────────────────────
 async function loadTOC() {
-    const toc    = await (await fetch('/get_toc')).json();
+    const toc    = await (await fetch(`/get_toc?book=${encodeURIComponent(currentBook)}`)).json();
     const tocDiv = document.getElementById('toc-container');
     tocDiv.innerHTML = toc.length
         ? toc.map(item =>
             `<div class="toc-item" onclick="loadPage(${item.page})"
                   style="padding-left:${0.5 + (item.level - 1) * 0.75}rem">
-                ${item.title}<span class="toc-page-num"> p.${item.page}</span>
+                ${esc(item.title)}<span class="toc-page-num"> p.${item.page}</span>
              </div>`).join('')
         : '<p class="list-empty">No chapters found in this PDF.</p>';
 }
 
 // ── Bookmarks ────────────────────────────────────────────────────────
 async function addBookmark() {
-    if (!totalPages) return;
+    if (!currentBook) return;
     const note = prompt('Optional note for this bookmark:', '') || '';
     await fetch('/add_bookmark', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ page: currentPage, position: document.getElementById('audio-player').currentTime, note })
+        body: JSON.stringify({ book: currentBook, page: currentPage, position: player.currentTime || 0, note })
     });
     loadBookmarks();
     showTab('bookmarks');
 }
 
 async function loadBookmarks() {
-    const marks  = await (await fetch('/get_bookmarks')).json();
+    const marks  = await (await fetch(`/get_bookmarks?book=${encodeURIComponent(currentBook)}`)).json();
     const listEl = document.getElementById('bookmarks-list');
     listEl.innerHTML = marks.length
         ? marks.map(b =>
             `<div class="bookmark-item">
-                <span class="bookmark-jump" onclick="jumpToBookmark(${b.page}, ${b.position})">
-                    📌 p.${b.page}${b.note ? ' — ' + b.note : ''}
+                <span class="bookmark-jump" onclick="loadPage(${b.page}, ${b.position || 0})">
+                    📌 p.${b.page}${b.note ? ' — ' + esc(b.note) : ''}
                 </span>
                 <button class="bookmark-del" onclick="deleteBookmark(${b.id})">✕</button>
              </div>`).join('')
         : '<p class="list-empty">No bookmarks yet. Press <kbd>B</kbd> while listening.</p>';
 }
 
-async function jumpToBookmark(page, position) { resumePosition = position; pendingJump = true; await loadPage(page); }
 async function deleteBookmark(id) { await fetch(`/delete_bookmark/${id}`, { method: 'DELETE' }); loadBookmarks(); }
 
 // ── Playback controls ────────────────────────────────────────────────
 function changePage(d)   { loadPage(currentPage + d); }
 function goToPage()      { loadPage(parseInt(document.getElementById('page-input').value)); }
-function skipAudio(s)    { document.getElementById('audio-player').currentTime += s; }
-function changeSpeed(v)  { document.getElementById('audio-player').playbackRate = v; document.getElementById('speed-label').innerText = parseFloat(v).toFixed(1) + '×'; }
-function changeVolume(v) { document.getElementById('audio-player').volume = v; document.getElementById('volume-label').innerText = Math.round(v * 100) + '%'; }
-function handleVoiceChange() { preloadedPages.clear(); loadPage(currentPage); }
+function skipAudio(s)    { player.currentTime += s; }
+function changeSpeed(v)  { player.playbackRate = v; document.getElementById('speed-label').innerText = parseFloat(v).toFixed(1) + '×'; }
+function changeVolume(v) { player.volume = v; document.getElementById('volume-label').innerText = Math.round(v * 100) + '%'; }
+function handleVoiceChange() { preloadedPages.clear(); if (pageStarted) loadPage(currentPage); }
+
+// Pressing play before any page was requested (e.g. right after the app opens) starts the book
+player.addEventListener('play', () => {
+    if (!pageStarted && currentBook) {
+        player.pause();
+        document.getElementById('resume-banner').style.display = 'none';
+        loadPage(currentPage, currentPage === resumePage ? resumePosition : 0);
+    }
+});
+
+// Move on to the next page — but only if this one was read in full
+player.addEventListener('ended', async () => {
+    const page = currentPage, token = loadToken;
+    const st = await audioStatus(page);
+    if (token !== loadToken) return;
+    if (!st.ok) {
+        setStatus(`❌ ${st.error} (stopped on page ${page} — press Go to retry)`);
+        return;
+    }
+    if (currentPage < totalPages) changePage(1);
+    else setStatus('🎉 Finished the book!');
+});
 
 // ── Sleep timer ──────────────────────────────────────────────────────
 function setSleepTimer(minutes) {
@@ -1023,7 +1193,7 @@ function setSleepTimer(minutes) {
     if (minutes === 0) return;
     sleepEndTime = Date.now() + minutes * 60_000;
     sleepTimer   = setTimeout(() => {
-        document.getElementById('audio-player').pause();
+        player.pause();
         setStatus('😴 Sleep timer reached — paused.');
         document.getElementById('sleep-countdown').innerText = '';
         clearInterval(sleepInterval);
@@ -1046,28 +1216,32 @@ function updateStats() {
 }
 
 setInterval(() => {
-    const a = document.getElementById('audio-player');
-    if (!a.paused && totalPages > 0) { totalListenSecs++; pagesRead.add(currentPage); if (totalListenSecs % 3 === 0) updateStats(); }
+    if (!player.paused && totalPages > 0) { totalListenSecs++; pagesRead.add(currentPage); if (totalListenSecs % 3 === 0) updateStats(); }
 }, 1000);
 
-setInterval(() => {
-    const a = document.getElementById('audio-player');
-    if (!a.paused && totalPages > 0) {
-        fetch('/save_progress', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ page: currentPage, position: a.currentTime })
-        }).catch(() => {});
+// ── Saving progress (per book) ───────────────────────────────────────
+function saveProgressNow(position = null, useBeacon = false) {
+    if (!currentBook || !pageStarted) return;
+    const body = JSON.stringify({
+        book: currentBook, page: currentPage,
+        position: position ?? (player.currentTime || 0)
+    });
+    if (useBeacon && navigator.sendBeacon) {
+        navigator.sendBeacon('/save_progress', new Blob([body], { type: 'application/json' }));
+    } else {
+        fetch('/save_progress', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body }).catch(() => {});
     }
-}, 10_000);
+}
 
-document.getElementById('audio-player').addEventListener('ended', () => {
-    if (currentPage < totalPages) changePage(1);
-});
+setInterval(() => { if (!player.paused) saveProgressNow(); }, 10_000);
+// (a new page loading also fires 'pause', with currentTime already back at 0 — skip those)
+player.addEventListener('pause', () => { if (!player.ended && player.currentTime > 0) saveProgressNow(); });
+window.addEventListener('pagehide', () => saveProgressNow(null, true));
 
 // ── Keyboard shortcuts ───────────────────────────────────────────────
 document.addEventListener('keydown', (e) => {
     if (['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName)) return;
-    const a = document.getElementById('audio-player');
+    const a = player;
     switch (e.key) {
         case ' ':        e.preventDefault(); a.paused ? a.play() : a.pause(); break;
         case 'ArrowRight': e.preventDefault(); changePage(1); break;
@@ -1094,7 +1268,6 @@ async function searchGutenberg(append = false) {
     if (!append) {
         container.innerHTML = '<div class="lib-loading">🔍 Searching Gutenberg…</div>';
     } else {
-        // Remove the "load more" button
         const btn = container.querySelector('.lib-load-more');
         if (btn) btn.innerText = '⏳ Loading…';
     }
@@ -1106,7 +1279,7 @@ async function searchGutenberg(append = false) {
     try {
         const data = await (await fetch(url)).json();
         if (data.error) {
-            container.innerHTML = `<p class="list-empty">❌ ${data.error}</p>`;
+            container.innerHTML = `<p class="list-empty">❌ ${esc(data.error)}</p>`;
             return;
         }
 
@@ -1129,17 +1302,16 @@ async function searchGutenberg(append = false) {
             const coverSrc = book.cover || '';
             const langs = (book.languages || []).join(', ').toUpperCase();
             card.innerHTML = `
-                ${coverSrc ? `<img src="${coverSrc}" alt="Cover" loading="lazy">` : '<img src="" alt="" style="visibility:hidden">'}
+                ${coverSrc ? `<img src="${esc(coverSrc)}" alt="Cover" loading="lazy">` : '<img src="" alt="" style="visibility:hidden">'}
                 <div class="lib-card-info">
-                    <div class="lib-card-title" title="${book.title}">${book.title}</div>
-                    <div class="lib-card-author">${book.author}</div>
-                    <div class="lib-card-meta">📥 ${(book.downloads || 0).toLocaleString()} downloads · ${langs}</div>
+                    <div class="lib-card-title" title="${esc(book.title)}">${esc(book.title)}</div>
+                    <div class="lib-card-author">${esc(book.author)}</div>
+                    <div class="lib-card-meta">📥 ${(book.downloads || 0).toLocaleString()} downloads · ${esc(langs)}</div>
                 </div>
             `;
             container.appendChild(card);
         });
 
-        // Show count
         if (!append) {
             const info = document.createElement('div');
             info.className = 'lib-card-meta';
@@ -1172,50 +1344,24 @@ async function downloadGutenbergBook(bookId, title) {
     setStatus(`📥 Downloading "${title}" from Gutenberg…`);
     showTab('play');
 
-    const dropLabel = document.getElementById('drop-label');
-    dropLabel.innerText = `⏳ Loading: ${title}`;
-
     try {
         const resp = await fetch(`/gutenberg/download/${bookId}`);
         const data = await resp.json();
-
-        if (data.error) {
-            setStatus(`❌ ${data.error}`);
-            dropLabel.innerText = 'Drop PDF here or click to browse';
-            return;
-        }
-
-        // Reuse the same flow as uploadFile after receiving data
-        totalPages = data.total_pages;
-        pdfUrl     = data.pdf_url;
-        preloadedPages.clear(); pagesRead.clear(); totalListenSecs = 0; updateStats();
-
-        document.getElementById('total-pages').innerText = totalPages;
-        dropLabel.innerText = data.title || title;
-        document.getElementById('page-input').max = totalPages;
-
-        await initPDFJS(pdfUrl);
-        loadTOC();
-        loadBookmarks();
-
-        if (data.resume_page && data.resume_page > 1) {
-            resumePage     = data.resume_page;
-            resumePosition = data.resume_position || 0;
-            document.getElementById('resume-text').innerText = `Resume from page ${resumePage}`;
-            document.getElementById('resume-banner').style.display = 'flex';
-            loadPage(1);
-        } else {
-            loadPage(1);
-        }
-
+        if (data.error) { setStatus(`❌ ${data.error}`); return; }
+        // Saved into the books folder, so it now shows up under My Books too
+        await openBook(data.filename, true);
     } catch (err) {
         setStatus('❌ Failed to download book.');
-        dropLabel.innerText = 'Drop PDF here or click to browse';
     }
 }
 
 // ── Init ─────────────────────────────────────────────────────────────
 loadSupportedLanguages();
+loadLibrary().then(books => {
+    // Reopen the book read most recently, ready to continue
+    const last = books.find(b => b.last_opened);
+    if (last) openBook(last.filename, false);
+});
 </script>
 </body>
 </html>
