@@ -1329,7 +1329,7 @@ async function searchGutenberg(append = false) {
         : `/gutenberg/search?q=${encodeURIComponent(query)}`;
 
     try {
-        const data = await (await fetch(url)).json();
+        const data = await readJSON(await fetch(url));
         if (data.error) {
             container.innerHTML = `<p class="list-empty">❌ ${esc(data.error)}</p>`;
             return;
@@ -1353,18 +1353,21 @@ async function searchGutenberg(append = false) {
             card.onclick = () => downloadGutenbergBook(book.id, book.title);
             const coverSrc = book.cover || '';
             const langs = (book.languages || []).join(', ').toUpperCase();
+            const meta = book.downloads != null
+                ? `📥 ${book.downloads.toLocaleString()} downloads · ${langs}`
+                : `Project Gutenberg #${book.id}`;
             card.innerHTML = `
-                ${coverSrc ? `<img src="${esc(coverSrc)}" alt="Cover" loading="lazy">` : '<img src="" alt="" style="visibility:hidden">'}
+                ${coverSrc ? `<img src="${esc(coverSrc)}" alt="Cover" loading="lazy" onerror="this.style.visibility='hidden'">` : '<img src="" alt="" style="visibility:hidden">'}
                 <div class="lib-card-info">
                     <div class="lib-card-title" title="${esc(book.title)}">${esc(book.title)}</div>
                     <div class="lib-card-author">${esc(book.author)}</div>
-                    <div class="lib-card-meta">📥 ${(book.downloads || 0).toLocaleString()} downloads · ${esc(langs)}</div>
+                    <div class="lib-card-meta">${esc(meta)}</div>
                 </div>
             `;
             container.appendChild(card);
         });
 
-        if (!append) {
+        if (!append && data.count != null) {
             const info = document.createElement('div');
             info.className = 'lib-card-meta';
             info.style.cssText = 'padding:0.3rem 0;text-align:center';
@@ -1372,12 +1375,7 @@ async function searchGutenberg(append = false) {
             container.prepend(info);
         }
 
-        // Parse next page number from gutendex URL
-        gutenbergNextPage = null;
-        if (data.next) {
-            const m = data.next.match(/page=(\d+)/);
-            if (m) gutenbergNextPage = m[1];
-        }
+        gutenbergNextPage = data.next_page || null;
 
         if (gutenbergNextPage) {
             const more = document.createElement('div');
@@ -1392,13 +1390,19 @@ async function searchGutenberg(append = false) {
     }
 }
 
+// Reads a JSON reply, with a readable message if the server sent something else
+async function readJSON(resp) {
+    try { return await resp.json(); }
+    catch { return { error: `The server had a problem (error ${resp.status}). Check the window running app.py for details.` }; }
+}
+
 async function downloadGutenbergBook(bookId, title) {
-    setStatus(`📥 Downloading "${title}" from Gutenberg…`);
+    setStatus(`📥 Downloading "${title}" from Project Gutenberg… (long books can take up to a minute)`);
     showTab('play');
 
     try {
-        const resp = await fetch(`/gutenberg/download/${bookId}`);
-        const data = await resp.json();
+        const resp = await fetch(`/gutenberg/download/${bookId}?title=${encodeURIComponent(title)}`);
+        const data = await readJSON(resp);
         if (data.error) { setStatus(`❌ ${data.error}`); return; }
         // Saved into the books folder, so it now shows up under My Books too
         await openBook(data.filename, true);
