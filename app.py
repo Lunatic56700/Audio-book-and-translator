@@ -6,12 +6,14 @@ import asyncio
 import threading
 import subprocess
 from collections import Counter
+import xml.etree.ElementTree as ET
 
 import fitz  # PyMuPDF
 import requests as http_requests
 from flask import Flask, Response, render_template, request, jsonify, url_for, send_from_directory, send_file
 from werkzeug.utils import secure_filename
 from fpdf import FPDF
+from fpdf.enums import XPos, YPos
 import edge_tts
 from deep_translator import GoogleTranslator
 from database import (
@@ -723,57 +725,93 @@ def delete_bookmark_route(bookmark_id):
 # =============================================
 #  PROJECT GUTENBERG
 # =============================================
-GUTENDEX_API = 'https://gutendex.com/books'
+GUTENBERG_SITE = 'https://www.gutenberg.org'
+GUTENDEX_API = 'https://gutendex.com/books/'  # Trailing slash avoids a slow redirect
+HTTP_HEADERS = {'User-Agent': 'Mozilla/5.0 (Audiobook Player; personal use)'}
+RESULTS_PER_PAGE = 25
+ATOM = '{http://www.w3.org/2005/Atom}'
+
+
+def gutenberg_cover(book_id):
+    return f'{GUTENBERG_SITE}/cache/epub/{book_id}/pg{book_id}.cover.medium.jpg'
+
+
+def _search_gutenberg_site(query, page):
+    """Project Gutenberg's own search feed: fast and official."""
+    resp = http_requests.get(
+        f'{GUTENBERG_SITE}/ebooks/search.opds/',
+        params={'query': query, 'start_index': (page - 1) * RESULTS_PER_PAGE + 1},
+        headers=HTTP_HEADERS, timeout=(5, 20),
+    )
+    resp.raise_for_status()
+    feed = ET.fromstring(resp.content)
+    results = []
+    for entry in feed.findall(f'{ATOM}entry'):
+        # Book entries look like .../ebooks/1661.opds; others are "Authors", "Sort by" etc.
+        match = re.search(r'/ebooks/(\d+)\.opds$', entry.findtext(f'{ATOM}id', ''))
+        if not match:
+            continue
+        book_id = int(match.group(1))
+        results.append({
+            'id':        book_id,
+            'title':     (entry.findtext(f'{ATOM}title') or 'Untitled').strip(),
+            'author':    (entry.findtext(f'{ATOM}content') or 'Unknown').strip(),
+            'cover':     gutenberg_cover(book_id),
+            'languages': [],
+            'downloads': None,
+        })
+    has_next = any(link.get('rel') == 'next' for link in feed.findall(f'{ATOM}link'))
+    return {'count': None, 'next_page': page + 1 if has_next else None, 'results': results}
+
+
+def _search_gutendex(query, page):
+    """Backup: gutendex.com (has download counts, but is often slow or down)."""
+    resp = http_requests.get(GUTENDEX_API, params={'search': query, 'page': page},
+                             headers=HTTP_HEADERS, timeout=(5, 30))
+    if resp.status_code == 404:  # Asked for a page past the end
+        return {'count': 0, 'next_page': None, 'results': []}
+    resp.raise_for_status()
+    if 'json' not in resp.headers.get('content-type', ''):
+        raise ValueError('gutendex sent back an error page')
+    data = resp.json()
+
+    results = []
+    for book in data.get('results', []):
+        formats = book.get('formats', {})
+        if not any(k.startswith('text/plain') for k in formats):
+            continue  # Only books with a readable text version
+        results.append({
+            'id':        book['id'],
+            'title':     book.get('title', 'Untitled'),
+            'author':    ', '.join(a['name'] for a in book.get('authors', [])) or 'Unknown',
+            'cover':     formats.get('image/jpeg', ''),
+            'languages': book.get('languages', []),
+            'downloads': book.get('download_count', 0),
+        })
+    return {'count': data.get('count'), 'next_page': page + 1 if data.get('next') else None,
+            'results': results}
 
 
 @app.route('/gutenberg/search')
 def gutenberg_search():
-    """Proxy search to Gutendex API. Returns book results as JSON."""
+    """Searches Project Gutenberg. Returns book results as JSON."""
     query = request.args.get('q', '').strip()
-    page  = request.args.get('page', '1')
+    page = max(1, request.args.get('page', 1, type=int) or 1)
     if not query:
-        return jsonify({"count": 0, "results": []})
+        return jsonify({"count": 0, "next_page": None, "results": []})
 
-    try:
-        resp = http_requests.get(
-            GUTENDEX_API,
-            params={'search': query, 'page': page},
-            timeout=10
-        )
-        data = resp.json()
+    for search in (_search_gutenberg_site, _search_gutendex):
+        try:
+            return jsonify(search(query, page))
+        except Exception as e:
+            print(f'[Gutenberg search] {search.__name__} failed: {e}')
+    return jsonify({'error': "Couldn't reach Project Gutenberg right now. Check your internet "
+                             "connection and try again in a minute."}), 502
 
-        # Slim down the response to only what the frontend needs
-        results = []
-        for book in data.get('results', []):
-            # Only include books that have text format (readable books)
-            formats = book.get('formats', {})
-            has_text = any(k.startswith('text/plain') for k in formats)
-            if not has_text:
-                continue
 
-            authors = ', '.join(a['name'] for a in book.get('authors', []))
-            cover   = formats.get('image/jpeg', '')
-            langs   = book.get('languages', [])
-
-            results.append({
-                'id':        book['id'],
-                'title':     book.get('title', 'Untitled'),
-                'author':    authors or 'Unknown',
-                'cover':     cover,
-                'languages': langs,
-                'downloads': book.get('download_count', 0),
-                'summary':   (book.get('summaries') or [''])[0][:200],
-            })
-
-        return jsonify({
-            'count':    data.get('count', 0),
-            'next':     data.get('next'),
-            'previous': data.get('previous'),
-            'results':  results
-        })
-    except Exception as e:
-        print(f'[Gutenberg search error] {e}')
-        return jsonify({'error': str(e)}), 502
+# After each block of text, go back to the left margin on the next line
+# (newer fpdf2 versions otherwise leave the cursor at the right edge)
+NEXT_LINE = {'new_x': XPos.LMARGIN, 'new_y': YPos.NEXT}
 
 
 def text_to_pdf(text, title, filepath, chars_per_page=3000):
@@ -818,10 +856,10 @@ def text_to_pdf(text, title, filepath, chars_per_page=3000):
     # Title page
     pdf.set_font('Helvetica', 'B', 24)
     pdf.ln(60)
-    pdf.multi_cell(0, 12, safe_title, align='C')
+    pdf.multi_cell(0, 12, safe_title, align='C', **NEXT_LINE)
     pdf.ln(10)
     pdf.set_font('Helvetica', '', 11)
-    pdf.multi_cell(0, 7, 'From Project Gutenberg - Free eBooks', align='C')
+    pdf.multi_cell(0, 7, 'From Project Gutenberg - Free eBooks', align='C', **NEXT_LINE)
 
     # Body pages
     pdf.set_font('Helvetica', '', 11)
@@ -839,7 +877,7 @@ def text_to_pdf(text, title, filepath, chars_per_page=3000):
                     safe_words.append(' '.join(chunks))
                 else:
                     safe_words.append(word)
-            pdf.multi_cell(0, 5.5, ' '.join(safe_words))
+            pdf.multi_cell(0, 5.5, ' '.join(safe_words), **NEXT_LINE)
 
     pdf.output(filepath)
 
@@ -847,60 +885,87 @@ def text_to_pdf(text, title, filepath, chars_per_page=3000):
         return len(doc)
 
 
+def fetch_gutenberg_text(book_id):
+    """Downloads a book's plain text straight from gutenberg.org (gutendex only as a backup)."""
+    urls = [f'{GUTENBERG_SITE}/cache/epub/{book_id}/pg{book_id}.txt',
+            f'{GUTENBERG_SITE}/ebooks/{book_id}.txt.utf-8']
+    for url in urls + [None]:
+        if url is None:
+            # Last resort: ask gutendex where the text file is
+            try:
+                meta = http_requests.get(f'{GUTENDEX_API}{book_id}/', headers=HTTP_HEADERS,
+                                         timeout=(5, 30)).json()
+                formats = meta.get('formats', {})
+                url = next((u for k, u in formats.items() if k.startswith('text/plain')), None)
+            except Exception as e:
+                print(f'[Gutenberg] gutendex lookup failed: {e}')
+            if not url:
+                break
+        try:
+            resp = http_requests.get(url, headers=HTTP_HEADERS, timeout=(5, 60))
+            if resp.ok and 'text/plain' in resp.headers.get('content-type', '') and len(resp.content) > 500:
+                resp.encoding = 'utf-8'
+                return resp.text
+            print(f'[Gutenberg] {url} -> HTTP {resp.status_code} {resp.headers.get("content-type")}')
+        except Exception as e:
+            print(f'[Gutenberg] {url} failed: {e}')
+    return None
+
+
+def strip_gutenberg_boilerplate(text):
+    """Keeps only the book itself: drops Project Gutenberg's license header and footer
+    so they aren't read aloud."""
+    start = re.search(r'^\*\*\*\s*START OF (?:THE|THIS) PROJECT GUTENBERG.*$', text, re.I | re.M)
+    end = re.search(r'^\*\*\*\s*END OF (?:THE|THIS) PROJECT GUTENBERG.*$', text, re.I | re.M)
+    if start and end and start.end() < end.start():
+        return text[start.end():end.start()].strip()
+    if start:
+        return text[start.end():].strip()
+    return text.strip()
+
+
 @app.route('/gutenberg/download/<int:book_id>')
 def gutenberg_download(book_id):
     """
-    Download a book from Project Gutenberg, convert it to PDF and save it into the
+    Downloads a book from Project Gutenberg, converts it to PDF and saves it into the
     books folder, so it stays in the library like any uploaded book.
     """
+    # Downloaded before: reuse it (keeps reading progress)
+    for name in os.listdir(BOOKS_FOLDER):
+        if name.endswith(f'-pg{book_id}.pdf'):
+            return jsonify({'filename': name})
+
     try:
-        # 1. Get book metadata from Gutendex
-        meta_resp = http_requests.get(f'{GUTENDEX_API}/{book_id}', timeout=10)
-        meta = meta_resp.json()
-        title = meta.get('title', f'Book {book_id}')
-        formats = meta.get('formats', {})
+        print(f'[Gutenberg] Downloading book #{book_id}…')
+        book_text = fetch_gutenberg_text(book_id)
+        if not book_text:
+            return jsonify({'error': "This book has no plain-text version on Project Gutenberg "
+                                     "(it may be audio or images only), or the site couldn't be "
+                                     "reached. Try another book."}), 404
+
+        title = request.args.get('title', '').strip()
+        if not title:
+            found = re.search(r'^Title:\s*(.+)$', book_text[:5000], re.M)
+            title = found.group(1).strip() if found else f'Book {book_id}'
+        book_text = strip_gutenberg_boilerplate(book_text)
 
         stem = (secure_filename(title) or 'book')[:80]
         filename = f'{stem}-pg{book_id}.pdf'
-        if resolve_book(filename):
-            # Downloaded before: reuse it (keeps reading progress)
-            return jsonify({'filename': filename})
-
-        # 2. Find plain text URL
-        text_url = None
-        for key, url in formats.items():
-            if key.startswith('text/plain') and 'utf-8' in key:
-                text_url = url
-                break
-        if not text_url:
-            for key, url in formats.items():
-                if key.startswith('text/plain'):
-                    text_url = url
-                    break
-        if not text_url:
-            return jsonify({'error': 'No plain text version available for this book'}), 404
-
-        # 3. Download the text
-        print(f'[Gutenberg] Downloading text for "{title}" from {text_url}…')
-        text_resp = http_requests.get(text_url, timeout=30)
-        text_resp.encoding = 'utf-8'
-        book_text = text_resp.text
-
-        # 4. Convert to PDF (written to a temp name so a failed run leaves no broken book)
         filepath = os.path.join(BOOKS_FOLDER, filename)
-        temp_path = filepath + '.part'
+        temp_path = filepath + '.part'  # A failed run leaves no broken book behind
+
         print(f'[Gutenberg] Converting {len(book_text)} chars to PDF…')
         total = text_to_pdf(book_text, title, temp_path)
         os.replace(temp_path, filepath)
         print(f'[Gutenberg] Done — {total} pages.')
 
-        # 5. Save the real title so the library shows it
+        # Save the real title so the library shows it
         register_book(filename, title, total)
         return jsonify({'filename': filename})
 
     except Exception as e:
         print(f'[Gutenberg download error] {e}')
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': f"Couldn't prepare this book: {e}"}), 500
 
 
 if __name__ == '__main__':
