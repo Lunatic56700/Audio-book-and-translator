@@ -749,20 +749,10 @@ function getTranslateLang() {
     return document.getElementById('translate-lang').value || '';
 }
 
-function onTranslateToggle() {
-    const on = isTranslateOn();
-    const row = document.getElementById('translate-lang-row');
-    row.classList.toggle('visible', on);
-    if (!on) {
-        document.getElementById('translate-badge').style.display = 'none';
-    }
-    // Voices depend on language — refresh
-    updateVoicesForCurrentLang();
-    preloadedPages.clear();
-}
-
-function onTranslateLangChange() {
+function updateTranslateUI() {
+    const on   = isTranslateOn();
     const lang = getTranslateLang();
+    document.getElementById('translate-lang-row').classList.toggle('visible', on);
     const badge = document.getElementById('translate-badge');
     if (lang) {
         const info = supportedLangs.find(l => l.code === lang);
@@ -771,9 +761,26 @@ function onTranslateLangChange() {
     } else {
         badge.style.display = 'none';
     }
-    updateVoicesForCurrentLang();
-    preloadedPages.clear();
 }
+
+function saveTranslateSettings() {
+    try {
+        localStorage.setItem('translateOn', isTranslateOn());
+        localStorage.setItem('translateLang', document.getElementById('translate-lang').value);
+    } catch {}
+}
+
+// Switching language swaps to a matching voice and re-reads the current page in it
+async function onTranslationChanged() {
+    updateTranslateUI();
+    saveTranslateSettings();
+    preloadedPages.clear();
+    await updateVoicesForCurrentLang();
+    if (pageStarted) loadPage(currentPage);
+}
+
+function onTranslateToggle()     { onTranslationChanged(); }
+function onTranslateLangChange() { onTranslationChanged(); }
 
 async function loadSupportedLanguages() {
     try {
@@ -782,6 +789,16 @@ async function loadSupportedLanguages() {
         sel.innerHTML = '<option value="">— Select language —</option>' +
             supportedLangs.map(l => `<option value="${l.code}">${l.name}</option>`).join('');
     } catch(e) { console.error('Failed to load languages', e); }
+
+    // Bring back the translation setting from last time
+    try {
+        const lang = localStorage.getItem('translateLang') || '';
+        const sel  = document.getElementById('translate-lang');
+        if (lang && [...sel.options].some(o => o.value === lang)) sel.value = lang;
+        document.getElementById('translate-toggle').checked = localStorage.getItem('translateOn') === 'true';
+    } catch {}
+    updateTranslateUI();
+    await updateVoicesForCurrentLang();
 }
 
 function getActiveLocalePrefix() {
@@ -795,25 +812,39 @@ function getActiveLocalePrefix() {
     return 'en-';
 }
 
-async function updateVoicesForCurrentLang() {
-    const locale = getActiveLocalePrefix();
-    await loadVoicesForLocale(locale);
+let voicesReady = Promise.resolve();  // Pages wait for this so they never use a half-loaded list
+let voiceLoadToken = 0;               // Only the newest voice list is applied
+
+function updateVoicesForCurrentLang() {
+    const lang = isTranslateOn() ? getTranslateLang() : '';
+    const info = supportedLangs.find(l => l.code === lang);
+    voicesReady = loadVoicesForLocale(getActiveLocalePrefix(), info ? info.default_voice : 'en-US-AriaNeural');
+    return voicesReady;
 }
 
-async function loadVoicesForLocale(locale) {
+async function loadVoicesForLocale(locale, preferred) {
+    const token = ++voiceLoadToken;
     const sel = document.getElementById('voice-select');
     const cur = sel.value;
     sel.disabled = true;
-    sel.innerHTML = '<option>Loading…</option>';
-    try {
-        const voices = await (await fetch(`/get_voices?locale=${locale}`)).json();
-        sel.innerHTML = voices.length
-            ? voices.map(v => `<option value="${v.ShortName}">${v.FriendlyName}</option>`).join('')
-            : '<option value="en-US-AriaNeural">Aria (US Female)</option>';
-        if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
-    } catch {
-        sel.innerHTML = '<option value="en-US-AriaNeural">Aria (US Female)</option><option value="en-US-GuyNeural">Guy (US Male)</option>';
+    let voices = [];
+    try { voices = await (await fetch(`/get_voices?locale=${locale}`)).json(); } catch {}
+    if (token !== voiceLoadToken) {
+        await voicesReady;  // A newer language was picked meanwhile; wait for that list instead
+        return;
     }
+    if (voices.length) {
+        sel.innerHTML = voices.map(v => `<option value="${esc(v.ShortName)}">${esc(v.FriendlyName)}</option>`).join('');
+    } else {
+        // Voice list unavailable (offline?): still offer the language's own voice
+        sel.innerHTML = preferred && preferred !== 'en-US-AriaNeural'
+            ? `<option value="${esc(preferred)}">${esc(preferred)}</option>`
+            : '<option value="en-US-AriaNeural">Aria (US Female)</option><option value="en-US-GuyNeural">Guy (US Male)</option>';
+    }
+    // Keep the voice picked before if it speaks this language, else the language's usual voice
+    const has = v => [...sel.options].some(o => o.value === v);
+    if (has(cur)) sel.value = cur;
+    else if (preferred && has(preferred)) sel.value = preferred;
     sel.disabled = false;
 }
 
@@ -969,15 +1000,19 @@ async function initPDFJS(url) {
     pdfDoc = await pdfjsLib.getDocument(url).promise;
 }
 
+let renderTask = null;
 async function renderPage(num) {
     if (!pdfDoc) return;
     const page     = await pdfDoc.getPage(num);
+    if (renderTask) { renderTask.cancel(); renderTask = null; }  // Stop drawing the old page first
     const canvas   = document.getElementById('pdf-canvas');
     const ctx      = canvas.getContext('2d');
     const viewport = page.getViewport({ scale: pdfScale });
     canvas.width   = viewport.width;
     canvas.height  = viewport.height;
-    await page.render({ canvasContext: ctx, viewport }).promise;
+    const task = renderTask = page.render({ canvasContext: ctx, viewport });
+    try { await task.promise; } catch { return; }  // Cancelled because another page was picked
+    if (renderTask === task) renderTask = null;
     document.getElementById('pdf-scroll-container').scrollTop = 0;
 }
 
@@ -1013,6 +1048,7 @@ function audioQuery(extra = '') {
 }
 
 async function fetchAudio(page, preload = false) {
+    await voicesReady;
     const voice = document.getElementById('voice-select').value;
     const resp  = await fetch(`/get_audio/${page}/${voice}` + audioQuery(preload ? '&preload=1' : ''));
     return resp.json();
@@ -1085,9 +1121,13 @@ async function loadPage(pageNum, position = 0) {
             player.addEventListener('loadedmetadata', () => { player.currentTime = position; }, { once: true });
         }
         player.playbackRate = parseFloat(document.getElementById('speed-slider').value);
-        player.play().catch(() => setStatus(`▶ Press play to start page ${currentPage}`));
-
-        setStatus(`🔊 Playing page ${currentPage} of ${totalPages}${lang ? ` (translated to ${lang})` : ''}`);
+        // Status switches to "Playing" once sound actually starts (see the 'playing' listener)
+        playingStatus = `🔊 Playing page ${currentPage} of ${totalPages}${lang ? ` (translated to ${lang})` : ''}`;
+        if (!data.complete) setStatus(lang ? `🌐 Translating page ${currentPage} into ${lang}…` : `🔊 Starting page ${currentPage}…`);
+        player.play().catch(e => {
+            // Only a browser autoplay block needs the user; other errors are handled elsewhere
+            if (e.name === 'NotAllowedError' && token === loadToken) setStatus(`▶ Press play to start page ${currentPage}`);
+        });
         preloadNextPages(currentPage, PRELOAD_AHEAD);
     } catch {
         if (token === loadToken) setStatus('❌ Could not load audio.');
@@ -1170,6 +1210,18 @@ player.addEventListener('play', () => {
         document.getElementById('resume-banner').style.display = 'none';
         loadPage(currentPage, currentPage === resumePage ? resumePosition : 0);
     }
+});
+
+let playingStatus = '';
+player.addEventListener('playing', () => { if (playingStatus) setStatus(playingStatus); });
+
+// A page that couldn't be made (e.g. translation failed) — say why instead of going quiet
+player.addEventListener('error', async () => {
+    if (!pageStarted || !player.getAttribute('src')) return;
+    const page = currentPage, token = loadToken;
+    const st = await audioStatus(page);
+    if (token !== loadToken) return;
+    setStatus(`❌ ${st.ok ? 'Could not play this page.' : st.error} (page ${page} — press Go to retry)`);
 });
 
 // Move on to the next page — but only if this one was read in full
