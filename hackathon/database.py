@@ -1,6 +1,7 @@
+import os
 import sqlite3
 
-DB_PATH = "audiobook.db"
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audiobook.db")
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -23,18 +24,35 @@ def init_db():
         created_date TEXT DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (book_id) REFERENCES books(id)
     )''')
+    # Older databases don't track when a book was last opened
+    columns = [row[1] for row in c.execute('PRAGMA table_info(books)')]
+    if 'last_opened' not in columns:
+        c.execute('ALTER TABLE books ADD COLUMN last_opened TEXT')
     conn.commit()
     conn.close()
 
 def register_book(filename, title, total_pages):
+    """Adds the book if new, refreshes its metadata, and marks it as just opened."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('INSERT OR IGNORE INTO books (filename, title, total_pages) VALUES (?, ?, ?)',
               (filename, title, total_pages))
-    c.execute('UPDATE books SET total_pages=?, title=? WHERE filename=?',
+    c.execute('UPDATE books SET total_pages=?, title=?, last_opened=CURRENT_TIMESTAMP WHERE filename=?',
               (total_pages, title, filename))
     conn.commit()
     conn.close()
+
+def get_books_info():
+    """Returns {filename: {...}} for every book that has been opened before."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT filename, title, total_pages, last_page, last_opened FROM books')
+    rows = c.fetchall()
+    conn.close()
+    return {
+        r[0]: {"title": r[1], "total_pages": r[2], "last_page": r[3], "last_opened": r[4]}
+        for r in rows
+    }
 
 def save_progress(filename, page, position):
     conn = sqlite3.connect(DB_PATH)
