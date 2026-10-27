@@ -150,34 +150,89 @@ def unique_book_path(filename):
 # Google Translate allows ~5 requests a second, so requests are spaced out
 _translate_lock = threading.Lock()
 _last_translate = 0.0
-TRANSLATE_GAP = 0.3  # seconds between requests
+TRANSLATE_GAP = 0.3   # seconds between requests
+TRANSLATE_CHUNK = 1800  # characters per request
+GOOGLE_TRANSLATE_URL = 'https://translate.googleapis.com/translate_a/single'
+
+
+class TranslationError(Exception):
+    """Raised when a page can't be translated, so English is never read out by mistake."""
+
+
+def _normalize(text):
+    return " ".join(re.sub(r'[^\w]+', ' ', text.lower()).split())
+
+
+def _google_translate(text, target_lang):
+    """Google's JSON translate endpoint. Returns (translation, detected source language)."""
+    r = http_requests.post(
+        GOOGLE_TRANSLATE_URL,
+        params={'client': 'gtx', 'sl': 'auto', 'tl': target_lang, 'dt': 't'},
+        data={'q': text},
+        timeout=20,
+    )
+    if r.status_code == 429:
+        raise TranslationError("Google Translate is getting too many requests from this computer")
+    r.raise_for_status()
+    data = r.json()
+    translated = ''.join(part[0] for part in (data[0] or []) if part and part[0])
+    detected = data[2] if len(data) > 2 and isinstance(data[2], str) else ''
+    return translated, detected
+
+
+def _deep_translate(text, target_lang):
+    """Backup: the deep-translator library (scrapes Google's mobile page)."""
+    return GoogleTranslator(source='auto', target=target_lang).translate(text) or '', ''
 
 
 def _translate_chunk(text, target_lang):
     global _last_translate
+    problem = None
     for attempt in range(3):
-        with _translate_lock:
-            wait = _last_translate + TRANSLATE_GAP - time.monotonic()
-            if wait > 0:
-                time.sleep(wait)
-            _last_translate = time.monotonic()
-        try:
-            return GoogleTranslator(source='auto', target=target_lang).translate(text) or text
-        except Exception as e:
-            print(f"[Translation error] {e}")
-            time.sleep(1.5 * (attempt + 1))
-    print("[Translation] Giving up on this part — keeping the original text")
-    return text
+        for translate in (_google_translate, _deep_translate):
+            with _translate_lock:
+                wait = _last_translate + TRANSLATE_GAP - time.monotonic()
+                if wait > 0:
+                    time.sleep(wait)
+                _last_translate = time.monotonic()
+            try:
+                translated, detected = translate(text, target_lang)
+            except Exception as e:
+                if translate is _google_translate or problem is None:
+                    problem = e  # Google's reason is the one worth showing
+                print(f"[Translation error] {translate.__name__}: {e}")
+                continue
+            # Same text back means it wasn't translated (unless the book is already
+            # in that language)
+            # (very short bits like names or titles can legitimately stay the same)
+            unchanged = (_normalize(translated) == _normalize(text)
+                         and len(_normalize(text).split()) >= 8)
+            already_in_target = detected and detected.split('-')[0] == target_lang.split('-')[0]
+            if translated.strip() and (not unchanged or already_in_target):
+                return translated
+            if translate is _google_translate or problem is None:
+                problem = TranslationError("the translator sent the text back untranslated")
+            print(f"[Translation error] {translate.__name__}: came back untranslated")
+        if attempt < 2:
+            time.sleep(2 * (attempt + 1))  # Back off before trying again
+    raise TranslationError(str(problem) if problem else "translation failed")
 
 
-def translate_text(text, target_lang, chunk_size=4500):
-    """Translates a page via Google Translate. Usually one request per page; long pages
-    are split on sentence boundaries (the service has a ~5000-char limit per call)."""
+def translate_text(text, target_lang):
+    """Translates a page via Google Translate, a few sentences-aligned chunks at a time.
+    Raises TranslationError instead of ever returning untranslated text."""
     if not text.strip():
         return text
     chunks, current = [], ''
     for sentence in re.split(r'(?<=[.!?…])\s+', text):
-        if current and len(current) + len(sentence) + 1 > chunk_size:
+        while len(sentence) > TRANSLATE_CHUNK:  # Run-on "sentences": cut at a space
+            cut = sentence.rfind(' ', 0, TRANSLATE_CHUNK) + 1 or TRANSLATE_CHUNK
+            if current:
+                chunks.append(current)
+                current = ''
+            chunks.append(sentence[:cut].strip())
+            sentence = sentence[cut:]
+        if current and len(current) + len(sentence) + 1 > TRANSLATE_CHUNK:
             chunks.append(current)
             current = sentence
         else:
@@ -266,6 +321,7 @@ class PageAudioJob:
         self.parts = []
         self.part_done = []
         self.error = None
+        self.error_message = None  # What to tell the listener if something went wrong
         self.cond = threading.Condition()
 
     def _prepare(self, segments):
@@ -338,6 +394,9 @@ class PageAudioJob:
             app.logger.error("Couldn't prepare %s: %s", self.audio_path, e)
             with self.cond:
                 self.error = str(e) or type(e).__name__
+                if isinstance(e, TranslationError):
+                    self.error_message = (f"Couldn't translate this page ({e}). Nothing was saved, "
+                                          "so it will be translated properly when you try again.")
                 self.cond.notify_all()
             return
         await asyncio.gather(*(self._make_segment(i) for i in range(len(self.segments))))
@@ -362,7 +421,10 @@ _slots = _ConnectionSlots(MAX_TTS_CONNECTIONS)
 
 def audio_paths(filename, page_num, voice, translate_to=''):
     slug = book_slug(filename)
-    audio_filename = f"page_{page_num}_{voice}_{translate_to or 'original'}.mp3"
+    # Translated pages are tagged "-translated": older versions could save English audio
+    # under a translated name, and those files must not be reused
+    lang_tag = f"{translate_to}-translated" if translate_to else 'original'
+    audio_filename = f"page_{page_num}_{voice}_{lang_tag}.mp3"
     return (os.path.join(AUDIO_FOLDER, slug, audio_filename),
             url_for('static', filename=f'audio/{slug}/{audio_filename}'))
 
@@ -576,7 +638,8 @@ def audio_status(page_num, voice):
     if job and job.error:
         return jsonify({
             "ok": False,
-            "error": "The voice service stopped responding. Check your internet connection, "
+            "error": job.error_message or
+                     "The voice service stopped responding. Check your internet connection, "
                      "or run: pip install --upgrade edge-tts"
         })
     return jsonify({"ok": True})
